@@ -1,0 +1,32 @@
+Glue 
+
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, concat
+
+# Initialize Spark and Glue contexts
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+# Read the text file from S3
+data_frame = spark.read.text("s3://your_bucket/your_file.txt")
+
+# Remove the header and footer rows
+data_frame = data_frame.filter(~(col("value").startswith("header_row") | col("value").endswith("footer_row")))
+
+# Split the comma-separated values and select required columns
+data_frame = data_frame.selectExpr("split(value, ',')[9] as sbsb", 
+                                   "split(value, ',')[14] as plan", 
+                                   "split(value, ',')[19] as pbp", 
+                                   "split(value, ',')[24] as eff_date")
+
+# Register the DataFrame as a temporary table
+data_frame.createOrReplaceTempView("datatable")
+
+# Perform transformation using Spark SQL
+result_df = spark.sql("SELECT concat('@pSBSB=\"', sbsb, '\", @pPlan=\"', plan, '\", @pPbp=\"', pbp, '\", @pEff=\"', eff_date, '\"') as concatResult FROM datatable")
+
+# Write the result to a text file in S3
+result_df.write.text("s3://your_bucket/output.txt")
