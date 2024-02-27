@@ -148,5 +148,34 @@ data_with_column_names = data_lines.union(column_names_row)
 # Show DataFrame
 data_with_column_names.show()
 
-# Stop SparkSession
-spark.stop()
+--==========================
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+
+# Initialize SparkSession
+spark = SparkSession.builder \
+    .appName("Read Fixed Width File") \
+    .getOrCreate()
+
+# Define the schema based on column positions and lengths
+schema = "PlanID string, HNumber string, MNumber string, SType string, Val string, Startdate string, EndDate string"
+
+# Define column names and their positions and lengths
+columns = [
+    ("PlanID", 1, 5),
+    ("HNumber", 6, 15),
+    ("MNumber", 21, 5),
+    ("SType", 36, 5),
+    ("Val", 41, 15),
+    ("Startdate", 56, 8),
+    ("EndDate", 64, 8)
+]
+
+# Read the fixed width file, skipping the first 2 rows (header and column names)
+df = spark.read.text("s3://your_bucket_name/your_file.txt") \
+    .rdd \
+    .map(lambda row: [row.value[start-1:start+length-1].strip() for name, start, length in columns]) \
+    .toDF(schema)
+
+# Show the dataframe
+df.show()
