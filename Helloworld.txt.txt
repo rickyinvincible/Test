@@ -84,3 +84,53 @@ result.show()
 
 # Stop SparkSession
 spark.stop()
+
+
+
+--========••••••=••============
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import substring
+
+# Initialize SparkSession
+spark = SparkSession.builder \
+    .appName("FixedWidthFileReader") \
+    .getOrCreate()
+
+# Read the text file from S3
+file_path = "s3://your_bucket/your_file.txt"
+lines = spark.read.text(file_path).rdd.map(lambda r: r[0])
+
+# Filter out header and footer lines
+data_lines = lines.filter(~lines.startswith("***") & ~lines.startswith("****") & ~lines.startswith("**"))
+
+# Define column positions and lengths
+column_positions_lengths = [
+    (1, 5),
+    (6, 10),
+    (21, 5),
+    (36, 5),
+    (41, 15),
+    (56, 8),
+    (64, 8)
+]
+
+# Parse the fixed-width lines
+for i, (start, length) in enumerate(column_positions_lengths):
+    column_name = f"col_{i}"
+    data_lines = data_lines.withColumn(column_name, substring("value", start, length))
+
+# Drop the original 'value' column
+data_lines = data_lines.drop("value")
+
+# Define column names
+column_names = ["PlanID", "HNumber", "MNumber", "SType", "Val", "Startdate", "Enddate"]
+
+# Rename columns
+for i, col_name in enumerate(column_names):
+    data_lines = data_lines.withColumnRenamed(f"col_{i}", col_name)
+
+# Show DataFrame
+data_lines.show()
+
+# Stop SparkSession
+spark.stop()
