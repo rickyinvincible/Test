@@ -89,7 +89,7 @@ spark.stop()
 
 --========••••••=••============
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import substring
+from pyspark.sql.functions import substring, lit
 
 # Initialize SparkSession
 spark = SparkSession.builder \
@@ -103,34 +103,50 @@ lines = spark.read.text(file_path).rdd.map(lambda r: r[0])
 # Filter out header and footer lines
 data_lines = lines.filter(~lines.startswith("***") & ~lines.startswith("****") & ~lines.startswith("**"))
 
-# Define column positions and lengths
-column_positions_lengths = [
+# Define column positions and lengths for the column name row
+column_name_positions_lengths = [
     (1, 5),
     (6, 10),
-    (21, 5),
+    (21, 15),
     (36, 5),
     (41, 15),
     (56, 8),
     (64, 8)
 ]
 
-# Parse the fixed-width lines
-for i, (start, length) in enumerate(column_positions_lengths):
-    column_name = f"col_{i}"
+# Parse the column name row
+columns = []
+for start, length in column_name_positions_lengths:
+    columns.append(substring("value", start, length).alias("col_" + str(start)))
+
+# Create DataFrame for column names
+column_names_row = data_lines.filter(data_lines.startswith("H0354MBI")).map(lambda line: line).toDF()
+column_names_row = column_names_row.select(*columns)
+
+# Define column positions and lengths for the data row
+data_positions_lengths = [
+    (1, 5),
+    (6, 10),
+    (21, 15),
+    (36, 5),
+    (41, 15),
+    (56, 8),
+    (64, 8)
+]
+
+# Parse the data row
+for i, (start, length) in enumerate(data_positions_lengths):
+    column_name = f"col_{start}"
     data_lines = data_lines.withColumn(column_name, substring("value", start, length))
 
 # Drop the original 'value' column
 data_lines = data_lines.drop("value")
 
-# Define column names
-column_names = ["PlanID", "HNumber", "MNumber", "SType", "Val", "Startdate", "Enddate"]
-
-# Rename columns
-for i, col_name in enumerate(column_names):
-    data_lines = data_lines.withColumnRenamed(f"col_{i}", col_name)
+# Combine the data with column names
+data_with_column_names = data_lines.union(column_names_row)
 
 # Show DataFrame
-data_lines.show()
+data_with_column_names.show()
 
 # Stop SparkSession
 spark.stop()
