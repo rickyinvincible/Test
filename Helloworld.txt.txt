@@ -39,3 +39,48 @@ def make_api_call(username, password):
 # Replace 'hello' and 'world02A51cA' with your actual username and password
 bearer_token = make_api_call('hello', 'world02A51cA')
 print("Bearer token:", bearer_token)
+
+--======================================
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+
+# Initialize SparkSession
+spark = SparkSession.builder \
+    .appName("FixedWidthFileReader") \
+    .getOrCreate()
+
+# Read the text file from S3 and remove header and footer
+file_path = "s3://your_bucket/your_file.txt"
+df = spark.read.text(file_path)
+df = df.filter(~col("value").startswith("***") & ~col("value").endswith("***"))
+
+# Define the fixed widths of each column
+column_widths = [(0, 5), (6, 14), (15, 23)]  # Adjust based on your actual column widths
+
+# Define column names
+header = df.first()
+column_names = header.value.split()
+
+# Parse the fixed-width lines and create DataFrame
+for i, (start, end) in enumerate(column_widths):
+    df = df.withColumn(f"col_{i}", df["value"].substr(start + 1, end - start))
+
+# Drop the original 'value' column
+df = df.drop("value")
+
+# Rename columns with proper column names
+for i, name in enumerate(column_names):
+    df = df.withColumnRenamed(f"col_{i}", name)
+
+# Create a temporary view
+df.createOrReplaceTempView("fixed_width_data")
+
+# Query the data using Spark SQL
+result = spark.sql("SELECT * FROM fixed_width_data")
+
+# Show result
+result.show()
+
+# Stop SparkSession
+spark.stop()
