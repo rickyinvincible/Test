@@ -16,31 +16,17 @@ table3 = table3.withColumn("BLEI_ConcatResult",
            ((F.col("PartCPremium") + F.col("PartDPremium")) > 0),
            F.expr("""concat('@pBLPF_ID = "S4", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', termdate, '"')""")
           )
-          .otherwise(
-           F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', termdate, '"')""")
+          .when((F.col("Stype") == "MCAID") & (F.col("S_EffDate") <= F.col("effectivedate")) & (F.col("S_TermDate") >= F.col("termdate")),
+           F.expr("""concat('@pBLPF_ID = "M2", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', termdate, '"')""")
           )
-          .when((F.col("Stype") == "MCAID") & (F.col("S_EffDate") <= F.col("effectivedate")),
-           F.when(F.col("S_TermDate") >= F.col("termdate"),
-            F.expr("""concat('@pBLPF_ID = "M2", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', termdate, '"')""")
-           )
-           .otherwise(
-            F.when(F.col("S_TermDate") < F.col("termdate"),
-             F.expr("""concat('@pBLPF_ID = "M2", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', S_TermDate, '"')"""),
-             F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', date_add(S_TermDate, 1), '", @pBLBP_TERM_DT = "', termdate, '"')""")
-            )
-           )
+          .when((F.col("Stype") == "MCAID") & (F.col("S_EffDate") <= F.col("effectivedate")) & (F.col("S_TermDate") < F.col("termdate")),
+           F.expr("""concat('@pBLPF_ID = "M2", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', S_TermDate, '"')""")
           )
-          .when((F.col("Stype") == "MCAID") & (F.col("S_EffDate") > F.col("effectivedate")),
-           F.when(F.col("S_TermDate") >= F.col("termdate"),
-            F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', date_sub(S_EffDate, 1), '"')""")
-           )
-           .otherwise(
-            F.when(F.col("S_TermDate") < F.col("termdate"),
-             F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', date_add(S_TermDate, 1), '", @pBLBP_TERM_DT = "', termdate, '"')"""),
-             F.expr("""concat('@pBLPF_ID = "M2", @pBLBP_EFF_DT = "', S_EffDate, '", @pBLBP_TERM_DT = "', termdate, '"')"""),
-             F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', date_add(S_TermDate, 1), '", @pBLBP_TERM_DT = "', termdate, '"')""")
-            )
-           )
+          .when((F.col("Stype") == "MCAID") & (F.col("S_EffDate") > F.col("effectivedate")) & (F.col("S_TermDate") >= F.col("termdate")),
+           F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', date_sub(S_EffDate, 1), '"')""")
+          )
+          .when((F.col("Stype") == "MCAID") & (F.col("S_EffDate") > F.col("effectivedate")) & (F.col("S_TermDate") < F.col("termdate")),
+           F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', date_add(S_TermDate, 1), '", @pBLBP_TERM_DT = "', termdate, '"')""")
           )
           .otherwise(F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', termdate, '"')""")
 )
