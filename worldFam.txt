@@ -1,207 +1,48 @@
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
 
 # Create Spark session
 spark = SparkSession.builder.appName("table_merge_logic").getOrCreate()
 
-# Assume sb_df and span_df are your DataFrames with the respective columns
+# Assume sampleaData_df and span_df are your DataFrames with the respective columns
 
-# Step 1: Append table2 values to table1 as new columns and create table3
-table3 = sb_df.join(span_df, sb_df.MBI == span_df.MBI, "left_outer") \
-    .select(sb_df["*"], span_df["Stype"], span_df["S_EffData"], span_df["S_Termdata"])
+# Step 1: Append span_df values to sampleaData_df as new columns and create table3
+table3 = sampleaData_df.join(span_df, sampleaData_df.MBINumber == span_df.MBINumber, "left_outer") \
+    .select(sampleaData_df["*"], span_df["Stype"], span_df["S_EffDate"], span_df["S_TermDate"])
 
 # Step 2: Add BLEI_ConcatResult column based on the described logic
 table3 = table3.withColumn("BLEI_ConcatResult",
-    F.when((F.col("Stype") != "MCAID") & ((F.col("PW").isNotNull()) | (F.col("PW") != "N")) &
+    F.when((F.col("Stype") != "MCAID") & ((F.col("Prem_Withhold_opt").isNotNull()) | (F.col("Prem_Withhold_opt") != "N")) &
            ((F.col("PartCPremium") + F.col("PartDPremium")) > 0),
-           F.expr("named_struct('pBLPF_ID', 'S4', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', P_TermDate)")
+           F.expr("""concat('@pBLPF_ID = "S4", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', termdate, '"')""")
           )
           .otherwise(
-           F.expr("named_struct('pBLPF_ID', 'S1', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', P_TermDate)")
+           F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', termdate, '"')""")
           )
-          .when((F.col("Stype") == "MCAID") & (F.col("S_EffData") <= F.col("P_EffDate")),
-           F.when(F.col("S_Termdata") >= F.col("P_TermDate"),
-            F.expr("named_struct('pBLPF_ID', 'M2', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', P_TermDate)")
+          .when((F.col("Stype") == "MCAID") & (F.col("S_EffDate") <= F.col("effectivedate")),
+           F.when(F.col("S_TermDate") >= F.col("termdate"),
+            F.expr("""concat('@pBLPF_ID = "M2", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', termdate, '"')""")
            )
            .otherwise(
-            F.when(F.col("S_Termdata") < F.col("P_TermDate"),
-             F.expr("named_struct('pBLPF_ID', 'M2', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', S_Termdata)"),
-             F.expr("named_struct('pBLPF_ID', 'S1', 'pBLBP_EFF_DT', S_Termdata + 1, 'pBLBP_TERM_DT', P_TermDate)")
+            F.when(F.col("S_TermDate") < F.col("termdate"),
+             F.expr("""concat('@pBLPF_ID = "M2", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', S_TermDate, '"')"""),
+             F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', date_add(S_TermDate, 1), '", @pBLBP_TERM_DT = "', termdate, '"')""")
             )
            )
           )
-          .when((F.col("Stype") == "MCAID") & (F.col("S_EffData") > F.col("P_EffDate")),
-           F.when(F.col("S_Termdata") >= F.col("P_TermDate"),
-            F.expr("named_struct('pBLPF_ID', 'S1', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', S_Effdata - 1)"),
-            F.expr("named_struct('pBLPF_ID', 'M2', 'pBLBP_EFF_DT', S_Effdata, 'pBLBP_TERM_DT', P_TermDate)"),
-            F.expr("named_struct('pBLPF_ID', 'S1', 'pBLBP_EFF_DT', S_Termdata + 1, 'pBLBP_TERM_DT', P_TermDate)")
-           )
-          )
-)
-
-# Show the final DataFrame
-table3.show(truncate=False)
-
-# Stop the Spark session
-spark.stop()
-
-
-
------------------------------------------------------------------------------------------------------------
-
-
-from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
-
-# Create Spark session
-spark = SparkSession.builder.appName("table_merge_logic").getOrCreate()
-
-# Assume sb_df and span_df are your DataFrames with the respective columns
-
-# Step 1: Append table2 values to table1 as new columns and create table3
-table3 = sb_df.join(span_df, sb_df.MBI == span_df.MBI, "left_outer") \
-    .select(sb_df["*"], span_df["Stype"], span_df["S_EffData"], span_df["S_Termdata"])
-
-# Step 2: Add BLEI_ConcatResult column based on the described logic
-table3 = table3.withColumn("BLEI_ConcatResult",
-    F.when((F.col("Stype") != "MCAID") & ((F.col("PW").isNotNull()) | (F.col("PW") != "N")) &
-           ((F.col("PartCPremium") + F.col("PartDPremium")) > 0),
-           F.expr("""named_struct('pBLPF_ID', 'S4', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', P_TermDate)""")
-          )
-          .otherwise(
-           F.expr("""named_struct('pBLPF_ID', 'S1', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', P_TermDate)""")
-          )
-          .when((F.col("Stype") == "MCAID") & (F.col("S_EffData") <= F.col("P_EffDate")),
-           F.when(F.col("S_Termdata") >= F.col("P_TermDate"),
-            F.expr("""named_struct('pBLPF_ID', 'M2', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', P_TermDate)""")
+          .when((F.col("Stype") == "MCAID") & (F.col("S_EffDate") > F.col("effectivedate")),
+           F.when(F.col("S_TermDate") >= F.col("termdate"),
+            F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', date_sub(S_EffDate, 1), '"')""")
            )
            .otherwise(
-            F.when(F.col("S_Termdata") < F.col("P_TermDate"),
-             F.expr("""named_struct('pBLPF_ID', 'M2', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', S_Termdata)"""),
-             F.expr("""named_struct('pBLPF_ID', 'S1', 'pBLBP_EFF_DT', date_add(S_Termdata, 1), 'pBLBP_TERM_DT', P_TermDate)""")
+            F.when(F.col("S_TermDate") < F.col("termdate"),
+             F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', date_add(S_TermDate, 1), '", @pBLBP_TERM_DT = "', termdate, '"')"""),
+             F.expr("""concat('@pBLPF_ID = "M2", @pBLBP_EFF_DT = "', S_EffDate, '", @pBLBP_TERM_DT = "', termdate, '"')"""),
+             F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', date_add(S_TermDate, 1), '", @pBLBP_TERM_DT = "', termdate, '"')""")
             )
            )
           )
-          .when((F.col("Stype") == "MCAID") & (F.col("S_EffData") > F.col("P_EffDate")),
-           F.when(F.col("S_Termdata") >= F.col("P_TermDate"),
-            F.expr("""named_struct('pBLPF_ID', 'S1', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', date_sub(S_Effdata, 1))"""),
-            F.expr("""named_struct('pBLPF_ID', 'M2', 'pBLBP_EFF_DT', S_Effdata, 'pBLBP_TERM_DT', P_TermDate)"""),
-            F.expr("""named_struct('pBLPF_ID', 'S1', 'pBLBP_EFF_DT', date_add(S_Termdata, 1), 'pBLBP_TERM_DT', P_TermDate)""")
-           )
-          )
-)
-
-# Show the final DataFrame
-table3.show(truncate=False)
-
-# Stop the Spark session
-spark.stop()
-
-
--------------------------------------------------------------------------------------------------------------------------------------
-
-from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
-
-# Create Spark session
-spark = SparkSession.builder.appName("table_merge_logic").getOrCreate()
-
-# Assume sb_df and span_df are your DataFrames with the respective columns
-
-# Step 1: Append table2 values to table1 as new columns and create table3
-table3 = sb_df.join(span_df, sb_df.MBI == span_df.MBI, "left_outer") \
-    .select(sb_df["*"], span_df["Stype"], span_df["S_EffData"], span_df["S_Termdata"])
-
-# Step 2: Add BLEI_ConcatResult column based on the described logic
-table3 = table3.withColumn("BLEI_ConcatResult",
-    F.when((F.col("Stype") != "MCAID") & ((F.col("PW").isNotNull()) | (F.col("PW") != "N")) &
-           ((F.col("PartCPremium") + F.col("PartDPremium")) > 0),
-           F.expr("""named_struct('pBLPF_ID', 'S4', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', P_TermDate)""")
-          )
-          .when((F.col("Stype") == "MCAID") & (F.col("S_EffData") <= F.col("P_EffDate")),
-           F.when(F.col("S_Termdata") >= F.col("P_TermDate"),
-            F.expr("""named_struct('pBLPF_ID', 'M2', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', P_TermDate)""")
-           )
-           .otherwise(
-            F.when(F.col("S_Termdata") < F.col("P_TermDate"),
-             F.expr("""named_struct('pBLPF_ID', 'M2', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', S_Termdata)""")
-            )
-            .when(F.col("S_Termdata") >= F.col("P_TermDate"),
-             F.expr("""named_struct('pBLPF_ID', 'S1', 'pBLBP_EFF_DT', date_add(S_Termdata, 1), 'pBLBP_TERM_DT', P_TermDate)""")
-            )
-           )
-          )
-          .when((F.col("Stype") == "MCAID") & (F.col("S_EffData") > F.col("P_EffDate")),
-           F.when(F.col("S_Termdata") >= F.col("P_TermDate"),
-            F.expr("""named_struct('pBLPF_ID', 'S1', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', date_sub(S_Effdata, 1))""")
-           )
-           .otherwise(
-            F.when(F.col("S_Termdata") < F.col("P_TermDate"),
-             F.expr("""named_struct('pBLPF_ID', 'S1', 'pBLBP_EFF_DT', date_add(S_Termdata, 1), 'pBLBP_TERM_DT', P_TermDate)""")
-            )
-            .when(F.col("S_Termdata") >= F.col("P_TermDate"),
-             F.expr("""named_struct('pBLPF_ID', 'M2', 'pBLBP_EFF_DT', S_Effdata, 'pBLBP_TERM_DT', P_TermDate)""")
-            )
-           )
-          )
-          .otherwise(F.expr("""named_struct('pBLPF_ID', 'S1', 'pBLBP_EFF_DT', P_EffDate, 'pBLBP_TERM_DT', P_TermDate)"""))
-)
-
-# Show the final DataFrame
-table3.show(truncate=False)
-
-# Stop the Spark session
-spark.stop()
---===========================================================================================================
-
-from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
-
-# Create Spark session
-spark = SparkSession.builder.appName("table_merge_logic").getOrCreate()
-
-# Assume sb_df and span_df are your DataFrames with the respective columns
-
-# Step 1: Append table2 values to table1 as new columns and create table3
-table3 = sb_df.join(span_df, sb_df.MBI == span_df.MBI, "left_outer") \
-    .select(sb_df["*"], span_df["Stype"], span_df["S_EffData"], span_df["S_Termdata"])
-
-# Step 2: Add BLEI_ConcatResult column based on the described logic
-table3 = table3.withColumn("BLEI_ConcatResult",
-    F.when((F.col("Stype") != "MCAID") & ((F.col("PW").isNotNull()) | (F.col("PW") != "N")) &
-           ((F.col("PartCPremium") + F.col("PartDPremium")) > 0),
-           F.expr("""concat('@pBLPF_ID = "S4", @pBLBP_EFF_DT = "', P_EffDate, '", @pBLBP_TERM_DT = "', P_TermDate, '"')""")
-          )
-          .otherwise(
-           F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', P_EffDate, '", @pBLBP_TERM_DT = "', P_TermDate, '"')""")
-          )
-          .when((F.col("Stype") == "MCAID") & (F.col("S_EffData") <= F.col("P_EffDate")),
-           F.when(F.col("S_Termdata") >= F.col("P_TermDate"),
-            F.expr("""concat('@pBLPF_ID = "M2", @pBLBP_EFF_DT = "', P_EffDate, '", @pBLBP_TERM_DT = "', P_TermDate, '"')""")
-           )
-           .otherwise(
-            F.when(F.col("S_Termdata") < F.col("P_TermDate"),
-             F.expr("""concat('@pBLPF_ID = "M2", @pBLBP_EFF_DT = "', P_EffDate, '", @pBLBP_TERM_DT = "', S_Termdata, '"')"""),
-             F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', date_add(S_Termdata, 1), '", @pBLBP_TERM_DT = "', P_TermDate, '"')""")
-            )
-           )
-          )
-          .when((F.col("Stype") == "MCAID") & (F.col("S_EffData") > F.col("P_EffDate")),
-           F.when(F.col("S_Termdata") >= F.col("P_TermDate"),
-            F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', P_EffDate, '", @pBLBP_TERM_DT = "', date_sub(S_Effdata, 1), '"')""")
-           )
-           .otherwise(
-            F.when(F.col("S_Termdata") < F.col("P_TermDate"),
-             F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', date_add(S_Termdata, 1), '", @pBLBP_TERM_DT = "', P_TermDate, '"')"""),
-             F.expr("""concat('@pBLPF_ID = "M2", @pBLBP_EFF_DT = "', S_Effdata, '", @pBLBP_TERM_DT = "', P_TermDate, '"')"""),
-             F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', date_add(S_Termdata, 1), '", @pBLBP_TERM_DT = "', P_TermDate, '"')""")
-            )
-           )
-          )
-          .otherwise(F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', P_EffDate, '", @pBLBP_TERM_DT = "', P_TermDate, '"')""")
+          .otherwise(F.expr("""concat('@pBLPF_ID = "S1", @pBLBP_EFF_DT = "', effectivedate, '", @pBLBP_TERM_DT = "', termdate, '"')""")
 )
 
 # Show the final DataFrame
