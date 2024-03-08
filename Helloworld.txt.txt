@@ -179,3 +179,42 @@ df = spark.read.text("s3://your_bucket_name/your_file.txt") \
 
 # Show the dataframe
 df.show()
+-----------_================
+from pyspark.sql import SparkSession
+
+# Initialize SparkSession
+spark = SparkSession.builder \
+    .appName("Concatenate Type, EffDate, and TermDate Values by MemberId using SQL") \
+    .getOrCreate()
+
+# Assuming your original DataFrame is called df
+# Registering the DataFrame as a temporary view
+df.createOrReplaceTempView("original_table")
+
+# Dictionary mapping original types to their corresponding codes
+type_mapping = {"ES": "001", "MD": "002", "SS": "003"}
+
+# Creating a UDF to map types to their codes
+spark.udf.register("map_type", lambda type: type_mapping.get(type, ""), "string")
+
+# Using Spark SQL to achieve the transformation
+result_df = spark.sql("""
+    SELECT
+        MemberId,
+        CONCAT_WS("\\n", COLLECT_LIST(
+            CONCAT(
+                '@pMEM ="', MemberId, '",@pType="', map_type(Type), 
+                '",@pEffDate="', EffDate, '",@pTermDate="', TermDate, '"'
+            )
+        )) AS ConcatResult
+    FROM
+        original_table
+    GROUP BY
+        MemberId
+""")
+
+# Displaying the resulting DataFrame
+result_df.show(truncate=False)
+
+
+
