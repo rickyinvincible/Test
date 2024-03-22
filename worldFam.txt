@@ -36,3 +36,34 @@ table3.show(truncate=False)
 
 # Stop the Spark session
 spark.stop()
+--===================
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import concat_ws, col, lit, when
+
+# Create SparkSession
+spark = SparkSession.builder \
+    .appName("Conditional Key-Value Pairs") \
+    .getOrCreate()
+
+# Assuming you have already loaded your input data into a DataFrame named 'nmdm_dftable'
+
+# Define your key-value pairs with conditions
+concat_expr = concat_ws(",", 
+                        lit("@ppbpId="), col("pdbId"), 
+                        lit(",@pSegmentId="), col("segmentId"), 
+                        lit(",@pA_EffDate="), 
+                        when(col("AeffDate").isNotNull(), col("AeffDate")).otherwise(lit("")), 
+                        lit(",@pB_EffDate="), 
+                        when(col("BeffDate").isNotNull(), col("BeffDate")).otherwise(lit("")), 
+                        lit(",@pC_EffDate="), 
+                        when(col("CeffDate").isNotNull(), col("CeffDate")).otherwise(lit(""))
+                        # Add similar conditions for other optional columns
+                        )
+
+# Select subID as SID and the concatenated result with conditional key-value pairs
+result_df = nmdm_dftable.select(col("subID").alias("SID"), concat_expr.alias("ConcatResult"))
+
+# Now you can proceed to create a table from 'result_df' or perform further operations as needed
+
+
+
