@@ -1,0 +1,37 @@
+from pyspark.sql import SparkSession
+
+# Assuming spark is your SparkSession
+SBEL_df = spark.sql("""
+SELECT sb.sbsb_id AS SID,
+       CONCAT('@pUpdate_CD="AP',
+              '",@pSBEL_EffDate="', 
+              CASE 
+                  WHEN mepe.mepe_effectivedate <= sb.effectivedate AND sb.effectivedate <= mepe.mepe_termdate THEN 
+                      CASE 
+                          WHEN mepe.CSPI_ID != sb.CSPI_ID OR mepe.CSPD_CAT != sb.CSPD_CAT THEN sb.effectivedate 
+                          ELSE 'No Record' 
+                      END
+                  WHEN sb.effectivedate < mepe.mepe_effectivedate OR sb.effectivedate > mepe.mepe_termdate THEN sb.effectivedate
+                  WHEN mepe.mepe_effectivedate <= sb.termdate AND sb.termdate <= mepe.mepe_termdate THEN sb.termdate
+                  ELSE sb.effectivedate 
+              END,
+              '",@pSBEL_ELIG_TYPE="',
+              CASE 
+                  WHEN mepe.mepe_effectivedate <= sb.effectivedate AND sb.effectivedate <= mepe.mepe_termdate THEN 
+                      CASE 
+                          WHEN mepe.CSPI_ID != sb.CSPI_ID OR mepe.CSPD_CAT != sb.CSPD_CAT THEN 'CH' 
+                          ELSE 'AP' 
+                      END
+                  WHEN sb.effectivedate < mepe.mepe_effectivedate OR sb.effectivedate > mepe.mepe_termdate THEN 'RI'
+                  WHEN mepe.mepe_effectivedate <= sb.termdate AND sb.termdate <= mepe.mepe_termdate THEN 'TM'
+                  WHEN mepe.mepe_termdate < sb.termdate THEN 'TM'
+                  ELSE 'AP' 
+              END,
+              '",@pCSPD_CAT="M', 
+              '",@pCSPI_ID="', pc.classplanid,
+              '",@pSBEL_FI ="C', 
+       '"') AS SBEL_ConcatResult
+FROM sd_dfTable sb
+LEFT JOIN mepe_df mepe ON sb.sbsb_id = mepe.sbsb_id
+INNER JOIN pc_dftable pc ON sb.planid = pc.contractid AND sb.pbp = pc.pbp
+""")
