@@ -35,3 +35,52 @@ FROM sd_dfTable sb
 LEFT JOIN mepe_df mepe ON sb.sbsb_id = mepe.sbsb_id
 INNER JOIN pc_dftable pc ON sb.planid = pc.contractid AND sb.pbp = pc.pbp
 """)
+---=============
+from pyspark.sql import SparkSession
+
+# Assuming spark is your SparkSession
+SBEL_df = spark.sql("""
+WITH PreppedData AS (
+    SELECT sb.sbsb_id, 
+           sb.effectivedate, 
+           sb.termdate, 
+           pc.classplanid, 
+           mepe.mepe_effectivedate, 
+           mepe.mepe_termdate, 
+           mepe.CSPI_ID AS mepe_CSPI_ID, 
+           mepe.CSPD_CAT AS mepe_CSPD_CAT,
+           pc.CSPI_ID AS pc_CSPI_ID,
+           pc.CSPD_CAT AS pc_CSPD_CAT,
+           CASE 
+               WHEN mepe.mepe_effectivedate <= sb.effectivedate AND sb.effectivedate <= mepe.mepe_termdate THEN 
+                   CASE 
+                       WHEN mepe.CSPI_ID != pc.CSPI_ID OR mepe.CSPD_CAT != pc.CSPD_CAT THEN 'CH' 
+                       ELSE 'AP' 
+                   END
+               WHEN sb.effectivedate < mepe.mepe_effectivedate OR sb.effectivedate > mepe.mepe_termdate THEN 'RI'
+               WHEN mepe.mepe_effectivedate <= sb.termdate AND sb.termdate <= mepe.mepe_termdate THEN 'TM'
+               WHEN mepe.mepe_termdate < sb.termdate THEN 'TM'
+               ELSE 'AP' 
+           END AS EligType,
+           CASE 
+               WHEN mepe.mepe_effectivedate <= sb.effectivedate AND sb.effectivedate <= mepe.mepe_termdate AND (mepe.CSPI_ID != pc.CSPI_ID OR mepe.CSPD_CAT != pc.CSPD_CAT) THEN sb.effectivedate 
+               WHEN sb.effectivedate < mepe.mepe_effectivedate OR sb.effectivedate > mepe.mepe_termdate THEN sb.effectivedate
+               WHEN mepe.mepe_effectivedate <= sb.termdate AND sb.termdate <= mepe.mepe_termdate THEN sb.termdate
+               WHEN mepe.mepe_termdate < sb.termdate THEN sb.termdate
+               ELSE sb.effectivedate 
+           END AS EffDate
+    FROM sd_dfTable sb
+    LEFT JOIN mepe_df mepe ON sb.sbsb_id = mepe.sbsb_id
+    INNER JOIN pc_dftable pc ON sb.planid = pc.contractid AND sb.pbp = pc.pbp
+)
+SELECT sbsb_id AS SID,
+       CONCAT('@pUpdate_CD="AP', 
+              '",@pSBEL_EffDate="', EffDate, 
+              '",@pSBEL_ELIG_TYPE="', EligType, 
+              '",@pCSPD_CAT="', mepe_CSPD_CAT, 
+              '",@pCSPI_ID="', mepe_CSPI_ID,
+              '",@pSBEL_FI ="C', 
+              '"') AS SBEL_ConcatResult
+FROM PreppedData
+""")
+
