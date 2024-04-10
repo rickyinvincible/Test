@@ -142,5 +142,34 @@ SELECT sbsb_id AS SID,
               '"') AS SBEL_ConcatResult
 FROM PreppedData
 """)
-
+--=====================
+SELECT 'sbad' AS type,
+       Sbsb_id AS SID,
+       CONCAT(
+           -- First part for H record
+           CASE 
+               WHEN TRIM(address1) IS NOT NULL AND TRIM(address1) <> '' THEN 
+                   CONCAT('@pRECTYPE="SBAD",@pSBAD_UPDATE_CD="IN",@pSBSB_TYPE="H",@pADDR1="', address1,
+                          '",@pCity="', city, 
+                          '",@pSTATE="', state, 
+                          '",@pZip="', zip, '"')
+               ELSE '' 
+           END,
+           -- Separator between H and M records
+           CASE
+               WHEN TRIM(address1) IS NOT NULL AND TRIM(address1) <> '' AND TRIM(address2) IS NOT NULL AND TRIM(address2) <> '' THEN '\r\n'
+               ELSE ''
+           END,
+           -- Second part for M record
+           CASE 
+               WHEN TRIM(address2) IS NOT NULL AND TRIM(address2) <> '' THEN 
+                   CONCAT('@pRECTYPE="SBAD",@pSBAD_UPDATE_CD="IN",@pSBSB_TYPE="M",@pADDR2="', address2,
+                          '",@pCity="', city2, 
+                          '",@pSTATE="', state2, 
+                          '",@pZip="', zip2, '"')
+               ELSE '' 
+           END
+       ) AS SBAD_ConcatResult
+FROM sb_dfTable
+WHERE (TRIM(address1) IS NOT NULL AND TRIM(address1) <> '') OR (TRIM(address2) IS NOT NULL AND TRIM(address2) <> '')
 
