@@ -113,5 +113,53 @@ result_df.show(truncate=False)
 
 # Stop SparkSession
 spark.stop()
+-----============
+
+from pyspark.sql.functions import *
+
+# Pre-populate CSPI_ID data
+sd_df_with_CSPI_ID = spark.sql("""
+    SELECT 
+        sb.*,
+        pc.CSPI_ID
+    FROM 
+        sd_dfTable sb
+    INNER JOIN 
+        pc_dftable pc 
+    ON 
+        sb.planid = pc.contractid AND sb.pbp = pc.pbp
+""")
+
+# Now, you can use sd_df_with_CSPI_ID to build SBEL_df
+SBEL_df = spark.sql("""
+    SELECT 
+        sd.sbsb_id AS SID,
+        CASE
+            WHEN m.sbsb_id IS NULL THEN CONCAT('@pUpdate_CD="AP’,"@pSBEL_EffDate="', sd.effectivedate, '",@pSBEL_ELIG_TYPE="SL"')
+            WHEN m.sbsb_id IS NOT NULL AND sd.effectivedate BETWEEN m.mepe_effectivedate AND m.mepe_termdate AND sd.CSPI_ID = m.CSPI_ID AND sd.CSPD_CAT = m.CSPD_CAT THEN NULL
+            WHEN m.sbsb_id IS NOT NULL AND sd.effectivedate BETWEEN m.mepe_effectivedate AND m.mepe_termdate AND (sd.CSPI_ID != m.CSPI_ID OR sd.CSPD_CAT != m.CSPD_CAT) THEN CONCAT('@pUpdate_CD="AP’,"@pSBEL_EffDate="', sd.effectivedate, '",@pSBEL_ELIG_TYPE="CH"')
+            WHEN NOT EXISTS (SELECT * FROM mepe_df WHERE sd.sbsb_id = m.sbsb_id AND sd.effectivedate BETWEEN m.mepe_effectivedate AND m.mepe_termdate) THEN CONCAT('@pUpdate_CD="AP’,"@pSBEL_EffDate="', sd.effectivedate, '",@pSBEL_ELIG_TYPE="RI"')
+            ELSE NULL
+        END AS SBEL_ConcatResult
+    FROM 
+        sd_df_with_CSPI_ID sd
+    LEFT JOIN 
+        mepe_df m ON sd.sbsb_id = m.sbsb_id
+""")
+
+# Handling term date condition
+SBEL_df = SBEL_df.union(spark.sql("""
+    SELECT 
+        sd.sbsb_id AS SID,
+        CONCAT('@pUpdate_CD="AP’,"@pSBEL_EffDate="', sd.termdate, '",@pSBEL_ELIG_TYPE="TM"') AS SBEL_ConcatResult
+    FROM 
+        sd_df_with_CSPI_ID sd
+    JOIN 
+        mepe_df m ON sd.sbsb_id = m.sbsb_id
+    WHERE 
+        (sd.termdate BETWEEN m.mepe_effectivedate AND m.mepe_termdate) OR (sd.termdate > m.mepe_termdate)
+"""))
+
+
 
 
