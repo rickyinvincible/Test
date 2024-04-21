@@ -240,6 +240,80 @@ SELECT
       ) THEN CONCAT('@pSBEL_EffDate=', CAST(sd.effectivedate AS STRING), ',@pSBEL_ELIG_TYPE="RI"')
       
     ELSE CONCAT('@pRECTYPE="SBEL",@pSBEL_Update_CD="IN",', '@pSBEL_EffDate="', CAST(sd.effectivedate AS STRING), '",@pSBEL_ELIG_TYPE="SL",', '@pCSPD_CAT="M",', '@pCSPI_ID="', sd.CSPI_ID, '",@pSBEL_FI ="C"
+---=========================================
+
+from pyspark.sql import SparkSession
+
+# Assuming the Spark session is already created and named as 'spark'
+# and DataFrames named sd_dfTable, mepe_df, sbel_df are defined
+
+# Register the DataFrames as SQL temporary views
+sd_dfTable.createOrReplaceTempView("sd_df")
+mepe_df.createOrReplaceTempView("mepe_df")
+sbel_df.createOrReplaceTempView("sbel_df")
+
+# SQL query to generate keywords, adjusted to avoid subqueries in CASE
+sql_query = """
+WITH PreChecks AS (
+    SELECT
+        sd.sbsb_id,
+        sd.effectivedate,
+        sd.termdate,
+        sd.CSPI_ID,
+        MAX(CASE WHEN mepe.mepe_effectivedate <= sd.effectivedate AND sd.effectivedate <= mepe.mepe_termdate THEN 1 ELSE 0 END) AS InDateRange,
+        MAX(CASE WHEN sd.effectivedate < mepe.mepe_effectivedate OR sd.effectivedate > mepe.mepe_termdate THEN 1 ELSE 0 END) AS OutOfDateRange,
+        MAX(CASE WHEN mepe.CSPI_ID != sd.CSPI_ID OR mepe.CSCS_ID != sd.CSCS_ID THEN 1 ELSE 0 END) AS DifferentIds
+    FROM
+        sd_df sd
+    LEFT JOIN
+        mepe_df mepe ON mepe.sbsb_id = sd.sbsb_id
+    GROUP BY
+        sd.sbsb_id, sd.effectivedate, sd.termdate, sd.CSPI_ID
+),
+VoidKeywords AS (
+    SELECT
+        sbel.sbsb_id,
+        CONCAT_WS('\r\n', COLLECT_LIST(
+            CONCAT('@pSBEL_Update_CD="VC",@pSBEL_EffDate=', CAST(sbel.SBEL_EFF_DT AS STRING), ',@pSBE_MCTR_VRSN_NVL="CE"')
+        )) AS VoidKeyword
+    FROM
+        sbel_df sbel
+    WHERE
+        sbel.SBEL_VOID_IND = 'N'
+    GROUP BY
+        sbel.sbsb_id
+)
+SELECT
+    pc.sbsb_id AS SID,
+    CONCAT(
+        CASE
+            WHEN pc.effectivedate = pc.termdate AND pc.InDateRange = 1 THEN CONCAT(
+                '@pSBEL_EffDate=', CAST(DATE_SUB(pc.effectivedate, 1) AS STRING), ',@pSBEL_ELIG_TYPE="TM"',
+                '\r\n', vk.VoidKeyword
+            )
+            WHEN pc.termdate > (SELECT MAX(mepe.mepe_termdate) FROM mepe_df mepe WHERE mepe.sbsb_id = pc.sbsb_id) THEN CONCAT(
+                '@pSBEL_EffDate=', CAST(pc.termdate AS STRING), ',@pSBEL_ELIG_TYPE="TM"',
+                '\r\n', vk.VoidKeyword
+            )
+            WHEN pc.DifferentIds = 1 THEN CONCAT('@pSBEL_EffDate=', CAST(pc.effectivedate AS STRING), ',@pSBEL_ELIG_TYPE="CH"')
+            WHEN pc.OutOfDateRange = 1 THEN CONCAT('@pSBEL_EffDate=', CAST(pc.effectivedate AS STRING), ',@pSBEL_ELIG_TYPE="RI"')
+            ELSE CONCAT('@pRECTYPE="SBEL",@pSBEL_Update_CD="IN",', '@pSBEL_EffDate="', CAST(pc.effectivedate AS STRING), '",@pSBEL_ELIG_TYPE="SL",', '@pCSPD_CAT="M",', '@pCSPI_ID="', pc.CSPI_ID, '",@pSBEL_FI ="C"')
+        END AS SBEL_ConcatResult
+FROM
+    PreChecks pc
+LEFT JOIN
+    VoidKeywords vk ON vk.sbsb_id = pc.sbsb_id
+"""
+
+# Execute the query
+keywords_df = spark.sql(sql_query)
+
+# Show the result
+keywords_df.show(truncate=False)
+
+
+
+
 
 
 
