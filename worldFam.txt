@@ -311,7 +311,20 @@ keywords_df = spark.sql(sql_query)
 # Show the result
 keywords_df.show(truncate=False)
 
+---=================
+from pyspark.sql.functions import col, concat_ws, lit, when
 
+# Expression to output specific strings for 'ENG' and 'SP', and 'O' for other cases
+Concat_expr = concat_ws("",
+    when((col("lan") == "ENG") | (col("lan") == "SP"),
+        when(col("lan") == "ENG", concat_ws("", lit("@pLang=\""), col("lan"), lit("\"")))
+        .otherwise(lit("@plan=s"))
+    ).otherwise(lit("O")),  # Outputs 'O' if 'lan' is not 'ENG' or 'SP'
+    lit("@pmbi"), col("mbi"), lit("\"")
+)
+
+# Selecting the expression with an alias
+drawl = nmdm_df.select(Concat_expr.alias("nmdm_concatResult"))
 
 
 
