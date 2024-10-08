@@ -1,32 +1,2438 @@
-Glue 
-
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import col, concat, when, lit, regexp_replace, to_date, trim, concat_ws, length
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, concat
+import datetime as dt
+import logging
+import json
+import boto3
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql import Row
+import urllib.request
+import urllib.parse
+import json
+import base64
+import io
+import pandas as pd
+import csv
+import pyspark.sql.functions as F
+import requests
+import random
+import urllib
+from io import StringIO
+#from pyspark.sql.functions import *
+#from pyspark.sql.functions import *
+from pyspark.sql.types import StructType, StructField, DateType, StringType
 
-# Initialize Spark and Glue contexts
-sc = SparkContext()
+######################################## Logger Declarations ########################
+msg_format = '%(asctime)s %(levelname)s %(name)s: %(message)s'
+datetime_format = '%Y-%m-%d %H:%M:%S'
+logging.basicConfig(format=msg_format, datefmt=datetime_format)
+logger = logging.getLogger('fct_eam_request')
+logger.setLevel(logging.INFO)
+
+def log_info(message):
+    logger.info(message)
+
+displayCountFlag = True
+def show_dataframe_details(df, functionality, showCountflag,noOfRowToPrint, truncateFlag):
+    if (showCountflag):
+        logger.info(functionality + " count:" + str(df.count()))
+    elif (noOfRowToPrint > 0):
+        logger.info(functionality)
+        df.show(noOfRowToPrint, truncateFlag)
+    else:
+        logger.info(functionality)
+        df.show(truncate=truncateFlag)
+
+boto3_session = boto3.session.Session()
+s3 =boto3_session.client('s3')
+
+sc = SparkContext.getOrCreate()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
+job = Job(glueContext)
+#dyf = glueContext.create_dynamic_frame.from_catalog(database='database_name', table_name='table_name')
+logger.info("Starting to EAM Facets Synchronization")
 
-# Read the text file from S3
-data_frame = spark.read.text("s3://your_bucket/your_file.txt")
+args = getResolvedOptions(sys.argv, ['facets_dbname','fct_eam_request_s3_bucket','fct_eam_keyword_s3_bucket_name','eam_secrets_name','secrets_account_ID','facets_region','eam_cloud_jdbc_url','fac_jdbc_url','facets_secrets_name','pc_url','pc_secret_name','locationapi_secret_name','location_api_auth_url','location_api_url','pcp_sp_db','pc_access_token_url'])
+_facetsdbName=args['facets_dbname']
+_fct_eam_request_s3_bucket=args['fct_eam_request_s3_bucket']
+_fct_eam_keyword_s3_bucket_name=args['fct_eam_keyword_s3_bucket_name']
+_eam_secrets_name=args['eam_secrets_name']
+_facetssecrets_account_ID=args['secrets_account_ID']
+_facets_region=args['facets_region']
+_eam_cloud_jdbc_url=args['eam_cloud_jdbc_url']
+_fac_jdbc_url=args['fac_jdbc_url']
+_pc_url=args['pc_url']
+_pc_secret_name=args['pc_secret_name']
+_locationapi_secret_name=args['locationapi_secret_name']
+_location_api_auth_url=args['location_api_auth_url']
+_location_api_url=args['location_api_url']
+_pcp_sp_db=args['pcp_sp_db']
+_facets_secrets_name=args['facets_secrets_name']
+_pc_access_token_url=args['pc_access_token_url']
 
-# Remove the header and footer rows
-data_frame = data_frame.filter(~(col("value").startswith("header_row") | col("value").endswith("footer_row")))
+############################Common functions ##############################################
+def get_credentials(secret_name):
+    # Create a Secrets Manager client
+    #boto3_session = boto3.session.Session()
+    secrets_client = boto3_session.client(
+        service_name='secretsmanager',
+        region_name='us-east-1'
+    )
 
-# Split the comma-separated values and select required columns
-data_frame = data_frame.selectExpr("split(value, ',')[9] as sbsb", 
-                                   "split(value, ',')[14] as plan", 
-                                   "split(value, ',')[19] as pbp", 
-                                   "split(value, ',')[24] as eff_date")
+    get_secret_value_response = secrets_client.get_secret_value(SecretId=secret_name)
+    if 'SecretString' in get_secret_value_response:
+        secret = get_secret_value_response['SecretString']
+        secret_dict = json.loads(secret)
+        return secret_dict['client_id'], secret_dict['client_secret']
+    else:
+        raise Exception("Secret not found or invalid format.")
 
-# Register the DataFrame as a temporary table
-data_frame.createOrReplaceTempView("datatable")
+def make_api_call(secret_name):
+    username, password  = get_credentials(secret_name)
 
-# Perform transformation using Spark SQL
-result_df = spark.sql("SELECT concat('@pSBSB=\"', sbsb, '\", @pPlan=\"', plan, '\", @pPbp=\"', pbp, '\", @pEff=\"', eff_date, '\"') as concatResult FROM datatable")
+    #url = 'https://cigna.oktapreview.com/oauth2/default/v1/token'
+    url = _pc_access_token_url
+    credentials = f"{username}:{password}"
+    encoded_credentials = base64.b64encode(credentials.encode()).decode()
+    data = urllib.parse.urlencode({'grant_type': 'client_credentials'}).encode()
+    #encoded_credentials = encode_credentials(username, password)
+    headers = {
+        'Authorization': f'Basic {encoded_credentials}'
+    }
 
-# Write the result to a text file in S3
-result_df.write.text("s3://your_bucket/output.txt")
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req) as response:
+            if response.status == 200:
+                # Process the API response data here
+                api_data = json.loads(response.read().decode())
+                bearer_token = api_data.get('access_token')
+                return bearer_token
+            else:
+                #print("Failed to make API call. Status code:", response.status)
+                token_resp_status = response.status
+                logger.error(f'Failed to make API call. Status code: {token_resp_status}' )
+                return None
+    except urllib.error.URLError as e:
+        #print("Failed to get bearer token:", e.reason)
+        logger.error(f'Failed to get bearer token: {e.reason}')
+        return None
+
+# Method for API call to get Product catelog data
+def getProductCatalog(bearer_token):
+    #url = 'https://product.dev.gateway.dmom.gov-solutions-dev.aws.cignacloud.com/product/getProduct'
+    #url = 'https://product.int.gateway.dmom.gov-solutions-test.aws.cignacloud.com/product/getProduct'
+    #url = 'https://product.int.gateway.dmom.gov-solutions-test.aws.cignacloud.com/product/downloadBidFile'
+    headers = {
+        'Authorization': f'Bearer {bearer_token}'
+    }
+    #print("url posted:", _pc_url)
+    #req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+    req = urllib.request.Request(_pc_url,  headers=headers)
+    #print("received request",req)
+    #logger.info(f'received request : {req}')
+    try:
+        with urllib.request.urlopen(req) as response:
+            logger.info("urllib received")
+            if response.status == 200:
+                # Process the API response data here
+                logger.info("data received in 200 response")
+
+                excel_data = response.read()
+                excel_data_io = io.BytesIO(excel_data)
+                df_excel = pd.read_excel(excel_data_io, header=1, engine='openpyxl',dtype={'Segment':str,'Group ID':str,'Subgroup ID':str,'Class ID':str,'PBP':str})
+                #print(df_excel)
+                #logger.info(f'df_excel : {df_excel}')
+                req_fields =[
+                    "ProductID"
+                    ,"Product Name"
+                    ,"Effective Date"
+                    ,"Termination Date"
+                    ,"Group ID"
+                    ,"Subgroup ID"
+                    ,"Class ID"
+                    ,"Class Plan ID"
+                    ,"Product ID"
+                    ,"Contract ID"
+                    ,"PBP"
+                    ,"Plan Year"
+                    ,"Segment"
+                    ,"Product Suite"
+                    ,"EGWP"
+                    ,"EAM Group Name"
+                ]
+                df_excel_req = df_excel[req_fields].fillna('')
+                #print(df_excel_req)
+                #logger.info(f'df_excel_req : {df_excel_req}')
+                req_schema = StructType([
+                    StructField("ProductID", StringType(), True)
+                    ,StructField("Product Name", StringType(), True)
+                    ,StructField("Effective Date", StringType(), True)
+                    ,StructField("Termination Date", StringType(), True)
+                    ,StructField("Group ID", StringType(), True)
+                    ,StructField("Subgroup ID", StringType(), True)
+                    ,StructField("Class ID", StringType(), True)
+                    ,StructField("Class Plan ID", StringType(), True)
+                    ,StructField("Product ID", StringType(), True)
+                    ,StructField("Contract ID", StringType(), True)
+                    ,StructField("PBP", StringType(), True)
+                    ,StructField("Plan Year", StringType(), True)
+                    ,StructField("Segment", StringType(), True)
+                    ,StructField("Product Suite", StringType(), True)
+                    ,StructField("EGWP", StringType(), True)
+                    ,StructField("EAM Group Name", StringType(), True)
+                ])
+                logger.info("unwrapped productCatalog")
+
+
+                df_spark_excel = spark.createDataFrame(df_excel_req, schema = req_schema)
+                df_spark_excel = df_spark_excel.withColumn("effective date", to_date(df_spark_excel["effective date"], "MM/dd/yyyy")) \
+                    .withColumn("termination date", to_date(df_spark_excel["termination date"], "MM/dd/yyyy"))
+                #df_spark_excel.show()
+                show_dataframe_details(df_spark_excel,"df_spark_excel", displayCountFlag, 0, True)
+                return df_spark_excel
+            else:
+                pc_resp_status = response.status
+                logger.error(f"Failed to make API call. Status code: {pc_resp_status}")
+                return None
+    except urllib.error.URLError as e:
+        logger.error(f"Failed to make API call with error code: {e.reason}")
+        return None
+    except Exception as e1:
+        logger.error(f"Failed because:{e1}")
+        return None
+
+
+## function to process aech row to be converted into sp parameters
+def create_stored_params(row):
+    col_data = ''
+    if row.sp_name.find('spPCPSuggestion') > 0:
+        col_data = f"@GRGR_ID = '{row.GRGR_ID}', @CSCS_ID = '{row.CSCS_ID}', @CSPI_ID = '{row.CSPI_ID}', @EFFECTIVE_DATE = '{row.effdate}', @MemberZip = '{row.zip}', @MemLat = {row.latitude}, @MemLong = {row.longitude}"
+    if row.sp_name.find('spPCPLookup') > 0:
+        col_data = f"@GRGR_ID = '{row.GRGR_ID}', @CSCS_ID = '{row.CSCS_ID}', @CSPI_ID = '{row.CSPI_ID}', @EFFECTIVE_DATE = '{row.effdate}',@MemberZip = '{row.zip}', @MemLat = {row.latitude}, @MemLong = {row.longitude}, @ExistingMember='{row.memberPresent}',@PCP_FIRST_NAME='{row.PCPFirstName}', @PCP_LAST_NAME='{row.PCPLastName}', @NPI='{row.PCPNPI}'"
+    return (row.sbsb_id, row.sp_name, str(col_data))
+
+## function to map errors with their error codes
+def map_error_data(data):
+    error_map = {
+        'Error: Incorrect Input': 'OVR2',
+        'Error: No Match Found': 'OVR2',
+        'Error: NPI or First Name and Last Name is needed': 'OVR2',
+        'Error: Multiple Matches Found': 'OVR3',
+        'Error: No Match Found': 'OVR2',
+        'Error: Match found but provider was not a PCP': 'OVR7',
+        'Error: Match found but not in network': 'OVR4',
+        'Error: Match found but PCP termed prior to effective date': 'OVR5',
+        'Error: Match found but panel was closed and existing member flag was N': 'OVR6'
+    }
+    return error_map.get(data, data)
+
+
+## fucntion to execute sotred procedure by passing connection and stored procedure name and parameters
+def execute_sql_storedproc(connection, sbsb_id, sp_name, sp_parameters):
+    try:
+        statement = f"""{{call {sp_name}({sp_parameters})}}"""
+        exec_statement = connection.prepareStatement(statement)
+
+        rs = exec_statement.executeQuery()
+
+        data = []
+        while rs.next():
+            error = ""
+            val = rs.getString("Output")
+            if val.find('Error') > -1:
+                error = map_error_data(val)
+                val = ""
+
+            data.append((sbsb_id, val, error))
+
+        exec_statement.close()
+        return data
+
+    except Exception as error:
+        logger.error(f"Failed to execute the query': {error}")
+        raise error
+
+def process_file(file_path, file_key):
+    eam_legacy_input_df = spark.read.format("csv").option("header","False").option("comment","*").load(file_path)
+    #replace all null values with empty
+    eam_legacy_input_df = eam_legacy_input_df.fillna('')
+    show_dataframe_details(eam_legacy_input_df,"eam_legacy_input_df", displayCountFlag, 0, True)
+
+    try:
+        subData_df = eam_legacy_input_df.selectExpr("_c19 as sbsb_id",
+                                                    "_c18 as alt_sbsb_id",
+                                                    "_c25 as lastname",
+                                                    "_c26 as firstname",
+                                                    "_c24 as salutation",
+                                                    "_c27 as middleinitial",
+                                                    "_c29 as sex",
+                                                    "_c0 as mbi",
+                                                    "_c1 as planid",
+                                                    "_c2 as pbpid",
+                                                    "_c10 as Segment_Id",
+                                                    "date_format(to_date(_c4, 'MMddyyyy'), 'MM/dd/yyyy') as effectivedate",
+                                                    "to_date(_c4, 'MMddyyyy') as effdate",
+                                                    "to_date(_c118, 'MMddyyyy') as tmdate",
+                                                    "CASE WHEN to_date(_c118, 'MMddyyyy') is not null THEN date_format(to_date(_c118,'MMddyyyy'),'MM/dd/yyyy') ELSE '' END as termdate",
+                                                    "to_date(_c8, 'MMddyyyy') as ap_date_effectivedate",
+                                                    "to_date(_c23, 'MMddyyyy') as plan5_effectivedate",
+                                                    "CASE WHEN TRIM(_c20) IS NOT NULL AND TRIM(_c20) <> '' THEN _c20 ELSE 'Y' END as memberPresent",
+                                                    "_c39 as address1",
+                                                    "_c40 as address2",
+                                                    "_c41 as city",
+                                                    "_c42 as state",
+                                                    "_c43 as zip",
+                                                    "_c44 as phone",
+                                                    "_c46 as address2_1",
+                                                    "_c47 as address2_2",
+                                                    "_c48 as city2",
+                                                    "_c49 as state2",
+                                                    "_c50 as zip2",
+                                                    "_c51 as phone2",
+                                                    "_c150 as email",
+                                                    "_c93 as Prem_Withhold_opt",
+                                                    "CAST(_c94 AS DOUBLE)  as PartCPremium ",
+                                                    "CAST(_c95 AS DOUBLE)  as PartDPremium ",
+                                                    "_c121 as LEPAmount",
+                                                    "CASE WHEN TRIM(_c54) = 'NOPCP' THEN '' ELSE _c54 END as PCPFirstName",
+                                                    "CASE WHEN TRIM(_c55) = 'NOPCP' THEN '' ELSE _c55 END as PCPLastName",
+                                                    "CASE WHEN TRIM(_c56) = 'NOPCP' THEN '' ELSE _c56 END as PCPID",
+                                                    "_c146 as medicaid",
+                                                    "CASE WHEN TRIM(_c57) = 'NOPCP' THEN '' ELSE _c57 END as PCPNPI"
+                                                    )
+
+        memData_df = eam_legacy_input_df.selectExpr("_c19 as sbsb_id",
+                                                    "_c18 as alt_sbsb_id",
+                                                    "_c25 as lastname",
+                                                    "CONCAT(_c26 , '',_c28 )as firstname",
+                                                    "_c27 as middleinitial",
+                                                    "_c14 as id_change",
+                                                    "_c24 as salutation",
+                                                    "_c29 as sex",
+                                                    "_c0 as mbi",
+                                                    "date_format(to_date(_c4, 'MMddyyyy'), 'MM/dd/yyyy') as effectivedate",
+                                                    "_c13 as ssn",
+                                                    "date_format(to_date(_c30, 'MMddyyyy'), 'MM/dd/yyyy') as dob",
+                                                    "_c33 as language",
+                                                    "_c71 as med_rec_num",
+                                                    "(CASE WHEN _c31 = '0' THEN 'U'"+
+                                                    "WHEN _c31 = '1' THEN 'S'"+
+                                                    "WHEN _c31 = '2' THEN 'M'"+
+                                                    "WHEN _c31 = '3' THEN 'W'"+
+                                                    "ELSE ''END) as maritalstatus",
+                                                    "_c125 as medicaid_num",
+                                                    "_c18 as memberid",
+                                                    "_c32 as race",
+                                                    "to_date(_c8, 'MMddyyyy') as ap_date_effectivedate",
+                                                    "to_date(_c23, 'MMddyyyy') as plan5_effectivedate",
+                                                    "_c137 as secondary_rxbin",
+                                                    "_c138 as secondary_rxpcn",
+                                                    "_c75 as Resp_Party_Name",
+                                                    "_c76 as Resp_Party_Phone",
+                                                    "CASE WHEN TRIM(_c56) = 'NOPCP' THEN '' ELSE _c56 END as PCPID",
+                                                    "_c121 as LEPAmount",
+                                                    "_c122 as LEPWaivedAmount",
+                                                    "_c123 as LEPSubsidyAmount",
+                                                    "_c124 as EGPaysLEP",
+                                                    "_c100 as secondary_insurance",
+                                                    "_c72 as other_insurance",
+                                                    "to_date(_c118, 'MMddyyyy') as term_date",
+                                                    "_c142 as new_ID_value"
+                                                    )
+
+
+        nmdmData_df = eam_legacy_input_df.selectExpr("_c19 as sbsb_id",
+                                                     "_c18 as alt_sbsb_id",
+                                                     "_c0 as mbi",
+                                                     "_c1 as planid",
+                                                     "_c2 as pbp",
+                                                     "_c10 as segment_id",
+                                                     "date_format(to_date(_c8, 'MMddyyyy'), 'MM/dd/yyyy') as ap_date_effectivedate",
+                                                     "date_format(to_date(_c36, 'MMddyyyy'), 'MM/dd/yyyy') as partA_EffDate",
+                                                     "date_format(to_date(_c37, 'MMddyyyy'), 'MM/dd/yyyy') as partB_EffDate",
+                                                     "date_format(to_date(_c38, 'MMddyyyy'), 'MM/dd/yyyy') as partD_EffDate",
+                                                     "_c35 as EGHP",
+                                                     "_c12 as enrollment_src",
+                                                     "_c11 as prior_commercial_override",
+                                                     "date_format(to_date(_c116, 'MMddyyyy'), 'MM/dd/yyyy')  as lis_effdate",
+                                                     "_c117 as lis_amount",
+                                                     "_c7 as election_type",
+                                                     "_c146 as medicaid",
+                                                     "_c145 as esrd",
+                                                     "_c96 as credible_coverage",
+                                                     "_c98 as emp_sub_override",
+                                                     "_c93 as Premium_Withhold_Option",
+                                                     "_c94  as Part_C_Premium",
+                                                     "_c95  as Part_D_Premium",
+                                                     "_c106 as RXGroup",
+                                                     "_c105 as RXID",
+                                                     "_c107 as RXBIN",
+                                                     "_c108 as RXPCN",
+                                                     "_c102 as SecondaryRXGroup",
+                                                     "_c101 as SecondaryRXID",
+                                                     "_c76  as EAF_Uncovered_Months ",
+                                                     "_c111 as LEP_Amount",
+                                                     "_c115 as Copay_Cat",
+                                                     "_c122 as LEP_Waived_Amount",
+                                                     "_c123 as LEP_Subsidy_Amount",
+                                                     "_c33  as LANGUAGE",
+                                                     "_c143 as Accessibility_Format",
+                                                     "lpad(_c144,5,'0') as SCC",
+                                                     "substr(lpad(_c144,5,'0'),1,2) as SCC_MCST",
+                                                     "substr(lpad(_c144,5,'0'),3,3) as SCC_MCCT"
+                                                     )
+
+
+        memd_df = eam_legacy_input_df.selectExpr("_c19 as sbsb_id",
+                                                 "_c18 as alt_sbsb_id",
+                                                 "date_format(to_date(_c4,'MMddyyy'), 'MM/dd/yyyy') as EffectiveDate",
+                                                 "date_format(to_date(_c118, 'MMddyyy'), 'MM/dd/yyyy') as TerminationDate",
+                                                 "date_format(to_date(_c8, 'MMddyyyy'), 'MM/dd/yyyy') as ap_date_effectivedate",
+                                                 "_c2 as pbp",
+                                                 "_c0 as MBI",
+                                                 "_c7 as ElectionType",
+                                                 "_c93 as PremiumWithholdoption",
+                                                 "_c94 as PartCPremium",
+                                                 "_c95 as PartDPremium",
+                                                 "_c10 as Segment_Id",
+                                                 "_c12 as EnrollmentSource",
+                                                 "_c97 as Numberofuncoveredmonths",
+                                                 "_c105 as RXID",
+                                                 "_c106 as RXGroup",
+                                                 "_c107 as RXBIN",
+                                                 "_c108 as RXPCN",
+                                                 "_c101 as SecondaryRXID",
+                                                 "_c102 as SecondaryRxGroup",
+                                                 "date_format(to_date(_c4, 'MMddyyyy'), 'MM/dd/yyyy') as L_effectivedate",
+                                                 "CASE WHEN to_date(_c118, 'MMddyyyy') is not null THEN date_format(to_date(_c118,'MMddyyyy'),'MM/dd/yyyy') ELSE '12/31/2199' END as L_termdate",
+                                                 "_c114 as LIS_Level",
+                                                 "_c115 as LIS_CoPayCategory",
+                                                 "date_format(to_date(_c116, 'MMddyyyy'), 'MM/dd/yyyy') as LIS_EffectiveDate",
+                                                 "CASE WHEN to_date(_c152, 'MMddyyyy') is not null THEN date_format(to_date(_c152,'MMddyyyy'),'MM/dd/yyyy') ELSE '12/31/2199' END as LIS_TermDate",
+                                                 "_c137 as SecondaryRXBIN",
+                                                 "_c138 as SecondaryRXPCN",
+                                                 "_c117 as LISAmount",
+                                                 "_c121 as LEPAmount",
+                                                 "_c122 as LEPWaivedAmount",
+                                                 "_c123 as LEPSubsidyAmount",
+                                                 "_c33 as Language",
+                                                 "_c143 as AccessibilityFormat",
+                                                 "_c15 as SEPReasonCode",
+                                                 "lpad(_c144,5,'0') as SCC",
+                                                 "substr(lpad(_c144,5,'0'),1,2) as SCC_MCST",
+                                                 "substr(lpad(_c144,5,'0'),3,3) as SCC_MCCT"
+                                                 )
+
+        #IF fiels 20 is empty then use field 19 but update it to ER when bulding subscriber Keyword
+        subData_df = subData_df.withColumn("SubEmpty",when(col("sbsb_id").isNull() | (col("sbsb_id")=="") ,1).otherwise(0)) \
+            .withColumn("sbsb_id", when(col("sbsb_id").isNull() | (col("sbsb_id")=="") , col("alt_sbsb_id")).otherwise(col("sbsb_id")))
+        memData_df = memData_df.withColumn("sbsb_id", when(col("sbsb_id").isNull() | (col("sbsb_id")=="") , col("alt_sbsb_id")).otherwise(col("sbsb_id")))
+        nmdmData_df = nmdmData_df.withColumn("sbsb_id", when(col("sbsb_id").isNull() | (col("sbsb_id")=="") , col("alt_sbsb_id")).otherwise(col("sbsb_id")))
+        memd_df = memd_df.withColumn("sbsb_id", when(col("sbsb_id").isNull() | (col("sbsb_id")=="") , col("alt_sbsb_id")).otherwise(col("sbsb_id")))
+
+        #Check if atleast one PBP exist for member. if not NoMatch and do not build SBSB keyword
+        dist_pbp_mbi_df = eam_span_dfA.filter(F.col('SpanType') == 'PBP').select(F.col('SpanMBINumber').alias('hasPBPMbi')).distinct()
+        subData_df =subData_df.join(dist_pbp_mbi_df, dist_pbp_mbi_df.hasPBPMbi == subData_df.mbi, how='left') \
+            .withColumn('flag_hasPBPMbi', F.when(F.col('hasPBPMbi').isNull(),1).otherwise(0))
+
+        #Add EGWP Number to Sub dataframe
+        if egwp_rematch_df.count() > 0:
+            subData_df =subData_df.join(filtered_egwp_df,(subData_df.mbi == filtered_egwp_df.SpanMBINumber) & (subData_df.pbpid == filtered_egwp_df.SpanValue) & (subData_df.effdate == filtered_egwp_df.Span_EffDate) , how='left') \
+                .select(subData_df["*"], egwp_rematch_df["eg_SpanValue"].alias('egwpNumber'))
+        else :
+            subData_df =subData_df.withColumn("egwpNumber",lit(None))
+
+        #subData_df.printSchema()
+        #subData_df.show()
+        show_dataframe_details(subData_df,"subData_df", displayCountFlag, 0, True)
+        #memData_df.show()
+        show_dataframe_details(memData_df,"memData_df", displayCountFlag, 0, True)
+        #nmdmData_df.show()
+        show_dataframe_details(nmdmData_df,"nmdmData_df", displayCountFlag, 0, True)
+        #memd_df.show()
+        show_dataframe_details(memd_df,"memd_df", displayCountFlag, 0, True)
+        logger.info('SUB, MEM, NMDM, MEMD Tables Created')
+    except Exception as err:
+        logger.error(f'FileSplitting error : {err}')
+        logger.info("FCT_EAMFCTMMS: ERROR: Unable to process legacy file")
+
+    ###########    BLEI KeyWord ##########################
+    # Create Spark session
+    #spark = SparkSession.builder.appName("table_merge_logic").getOrCreate()
+    #mock_row = Row(PLANID ='H0354', MBINumber = '1RM6QV4KJ20', SType = 'MCAID', VALUE = 'QMB', S_EffDate= '2024-01-01',S_TermDate='2024-08-01',LAST_MODIFIED='2024-05-01',CREATE_DATE='2024-05-01')
+    #mock_df = spark.createDataFrame([mock_row])
+
+    #eam_span_df =eam_span_df.union(mock_df)
+    #eam_span_df.show()
+    #Append EAM values to Span as new columns and create table3
+
+    eamSpan_df = subData_df.join(eam_span_df, subData_df.mbi == eam_span_df.MBINumber, "left_outer") \
+        .select(subData_df["*"],eam_span_df["MBINumber"], eam_span_df["SType"], eam_span_df["Value"], eam_span_df["S_EffDate"], eam_span_df["S_TermDate"])
+    #eamSpan_df.show()
+
+
+    #table3 = eamSpan_df.filter(col("SType") == "MCAID")
+    #print('table3')
+    blei_resA_df = subData_df
+    # Add BLEI_ConcatResult column based on the described logic
+    blei_resA_df = blei_resA_df.withColumn("BLEI_ConcatResultA",
+                               F.when((((F.col("PartCPremium") + F.col("PartDPremium")) > 0.0 ) & (F.col("Prem_Withhold_opt") != 'D')),
+                                      F.expr("""concat('@pRECTYPE="BLEI",@pBLPF_ID="S00000000004' ,'"')""")
+                                      )
+                            #    .when((F.col("medicaid") == "Y")  ,
+                            #          F.expr("""concat('@pRECTYPE="BLEI",@pBLPF_ID="M00000000002' ,'"'  )""")
+                            #          )
+                               .otherwise(F.expr("""concat('@pRECTYPE="BLEI",@pBLPF_ID="S00000000001', '"')"""))
+                               )
+    #table3.show(truncate=False)
+    show_dataframe_details(blei_resA_df,"blei_resA_df", displayCountFlag, 0, False)
+    # Show the final DataFrame
+
+    sub_blei_df = blei_resA_df
+    # sub_blei_df = subData_df.join(table3, subData_df.mbi == table3.mbi, "left_outer") \
+    #     .select(subData_df["*"], table3["BLEI_ConcatResultA"])
+    #sub_blei_df.show()
+    show_dataframe_details(sub_blei_df,"sub_blei_df", displayCountFlag, 0, True)
+    sub_blei_df.createOrReplaceTempView("sub_blei_dfTable")
+
+    #dfSql_blei.unpersist()
+    dfSql_bleiA = spark.sql("""
+       SELECT "BLEI" as Type, sbsb_id AS SID, 
+            CASE WHEN BLEI_ConcatResultA <>'' THEN 
+              CONCAT_WS("\\r\\n", COLLECT_LIST(
+               BLEI_ConcatResultA
+              ))
+            ELSE CONCAT('@pRECTYPE="BLEI",@pBLPF_ID="S00000000001', '"') END 
+            AS BLEI_ConcatResult
+        FROM sub_blei_dfTable
+        GROUP BY sbsb_id,BLEI_ConcatResultA, effdate, PartCPremium, PartDPremium, medicaid
+    """)
+    #print('dfSql_blei')
+    #dfSql_blei.show()
+    show_dataframe_details(dfSql_bleiA,"dfSql_bleiA", displayCountFlag, 0, True)
+
+    #######  SBWM KeyWord from Span file  ################
+
+    sbwmSpan_df = eamSpan_df.filter((col("SType") ==  "MCAID") |
+                                    (col("SType") ==  "HOSP"  )|
+                                    (col("SType") ==  "ESRD") |
+                                    (col("SType") ==  "KDTSP"))
+
+    sbwmSpan_df =sbwmSpan_df.withColumn("SBWM_EffDate", when(col("S_EffDate") >= col("effdate"),col("S_EffDate")).otherwise(col("effdate")))
+    #--TODO---- if i have two spans with same SEQ_NO the only and effdate the create only 1 rec
+    #sbwmSpan_df.show()
+
+    sbwmSpan_df.createOrReplaceTempView("sbwm_table")
+    # Creating a UDF to map types to their codes
+    spark.udf.register("WMDS_SEQ_NO", lambda SType,Value:  "1" if SType == "HOSP"
+    else "4" if SType == "KDTSP"
+    else "5" if SType == "ESRD"
+    else "6" if SType == "MCAID" and (Value == "QMB+" or Value == "SLMB+"  or Value == "FBDE"  )
+    else "7" if SType == "MCAID" and Value == "QMB"
+    else "8" if SType == "MCAID" and (Value == "SLMB" or Value == "QI" or Value == "QDWI")
+    else "unknown")
+
+    #dfSql_sbwm.unpersist()
+    #--TO-DO---HOSP mapped to 1
+    dfSql_sbwm = spark.sql("""
+       SELECT "SBWM" as Type, sbsb_id AS SID, 
+            CONCAT_WS("\\r\\n", COLLECT_LIST(
+                CONCAT(
+                    '@pRECTYPE="SBWM",@pSBWM_UPDATE_CD="AP",@pWMDS_SEQ_NO="', WMDS_SEQ_NO(SType, Value) ,
+                    '",@pSBWM_EFF_DT="', date_format(SBWM_EffDate, 'MM/dd/yyyy'),
+                    CASE WHEN S_TermDate ='9999-12-31' or S_TermDate= '2199-12-31' 
+                           THEN '' 
+                           ELSE CONCAT('",@pSBWM_TERM_DT="', date_format(S_TermDate, 'MM/dd/yyyy'),'",@pSBWM_MCTR_TRSN="RSN1') 
+                    END ,
+                    '"'
+                )
+            )) AS SBWM_ConcatResult
+        FROM sbwm_table
+        GROUP BY sbsb_id
+    """)
+    #dfSql_sbwm.show()
+    show_dataframe_details(dfSql_sbwm,"dfSql_sbwm", displayCountFlag, 0, True)
+
+
+    #row =dfSql_blei.collect()[0]
+    #Aaa= row["BLEI_ConcatResult"]
+    #print(Aaa)
+    #row =dfSql_sbwm.collect()[0]
+    #Abc = row["SBWM_ConcatResult"]
+    #print(Abc)
+
+
+
+
+
+
+
+    #================================================================================================
+    #######   Member  Record SBELcondition for change,term,reinstate,void or new      ################
+    #================================================================================================
+    #eam_span_df.show()
+    subData_df.createOrReplaceTempView("SD_dfTable")
+
+    sd_df_with_CS= spark.sql("""
+        SELECT   sb.*,
+        pc.`Class Plan ID` as CSPI_ID, pc.`Class ID` as CSCS_ID, PC.`Product ID` as productID, pc.`Group ID` as GRGR_ID, pc.`Subgroup ID` as SGSG_ID
+        ,pc.`Product Suite` AS ProductSuite
+        FROM sd_dfTable sb LEFT JOIN pc_dfTable pc ON sb.planid = pc.`Contract ID` AND CAST(sb.pbpid as int) = CAST(pc.pbp as int) 
+             AND (sb.effdate  BETWEEN  pc.`effective date` AND pc.`termination date`)
+             AND ((TRIM(pc.`EGWP`) ='Y' AND  sb.egwpNumber =pc.`EAM Group Name`) OR (TRIM(pc.`EGWP`) ='N'))                
+             AND CASE WHEN sb.Segment_ID is null OR sb.Segment_ID ='' THEN 
+                     CASE WHEN TRIM(pc.Segment) ='000' THEN '000' ELSE '001' END 
+                  ELSE sb.Segment_ID
+                  END = pc.Segment                
+    """)
+    #subData_df.show()
+    sd_df_with_CS.createOrReplaceTempView("sd_cs_dfTable")
+    subdf_count = subData_df.count()
+    sd_cs_count = sd_df_with_CS.count()
+    logger.info(f"subdf_count:{subdf_count}, sd_cs_count:{sd_cs_count}")
+    if subdf_count != sd_cs_count:
+        logger.info('Productcatalog has multiple records PBPs')
+
+    sd_cs_pbp_df = sd_df_with_CS.join(pbp_eam_span_df, (sd_df_with_CS.mbi == eam_span_df.MBINumber), "left_outer") \
+        .select(sd_df_with_CS["*"],pbp_eam_span_df["MBINumber"], pbp_eam_span_df["SType"], pbp_eam_span_df["Value"], pbp_eam_span_df["S_EffDate"], pbp_eam_span_df["S_TermDate"], pbp_eam_span_df["P_CSPI_ID"])
+    #sd_cs_pbp_df.show()
+    show_dataframe_details(sd_cs_pbp_df,"sd_cs_pbp_df", displayCountFlag, 0, True)
+
+    sd_cs_pbp_df.createOrReplaceTempView("sd_cs_pbp_dfTable")
+
+    df_sbel_pbp_Condition = spark.sql("""
+       SELECT
+            sd.sbsb_id,
+            sd.effdate as EAMeffdate,
+            sd.tmdate as EAMtmdate,
+            sd.S_EffDate,
+            sd.S_TermDate,
+            sd.CSPI_ID,
+            CASE WHEN COUNT(sd.S_EffDate) > 0 THEN 1 ELSE 0 END AS PBPRecordExists,
+            MAX(sd.S_TermDate ) as maxpbptermdate ,
+            MAX( mepe.f_MEPE_TERM_DT) as maxMepetermdate,
+            MAX(CASE WHEN sd.S_EffDate = sd.S_TermDate AND mepe.f_MEPE_EFF_DT <= sd.S_EffDate AND sd.S_EffDate <= mepe.f_MEPE_TERM_DT THEN 1 ELSE 0 END) AS TypeVoid,
+            MAX(CASE WHEN mepe.f_MEPE_EFF_DT <= sd.S_TermDate  AND sd.S_TermDate <= mepe.f_MEPE_TERM_DT THEN 1 ELSE 0 END) AS TypeTerm,
+            MAX(CASE WHEN (mepe.f_MEPE_EFF_DT <= sd.S_EffDate AND  sd.S_EffDate <= mepe.f_MEPE_TERM_DT) AND  (mepe.CSPI_ID = sd.CSPI_ID OR mepe.CSCS_ID = sd.CSCS_ID) THEN 1 ELSE 0 END ) AS TypeExistingNoChange,
+            MAX(CASE WHEN mepe.f_MEPE_EFF_DT <= sd.S_EffDate AND  sd.S_EffDate <= mepe.f_MEPE_TERM_DT AND  (mepe.CSPI_ID != sd.CSPI_ID OR mepe.CSCS_ID != sd.CSCS_ID) THEN 1 ELSE 0 END ) AS TypeChange,
+            MAX(CASE WHEN (sd.S_EffDate is not null) AND (sd.S_EffDate < mepe.f_MEPE_EFF_DT OR sd.effdate > mepe.f_MEPE_TERM_DT) THEN 1 ELSE 0 END) AS TypeReinstate,
+            CASE WHEN MAX(sd.S_TermDate ) < MAX( mepe.f_MEPE_TERM_DT) THEN 1 ELSE 0 END AS Cancellation
+        FROM
+            sd_cs_pbp_dfTable sd
+        LEFT JOIN
+            mepe_dfTable mepe ON mepe.sbsb_id = sd.sbsb_id
+        GROUP BY 1,2,3,4,5,6
+        """)
+    #df_sbel_pbp_Condition.show()
+    show_dataframe_details(df_sbel_pbp_Condition,"df_sbel_pbp_Condition", displayCountFlag, 0, True)
+    df_sbel_pbp_Condition.createOrReplaceTempView("statuscheck_dfTable")
+
+    df_gap = spark.sql("""
+    select 
+            sd.sbsb_id,
+            sd.mbi,
+            sd.S_EffDate,
+            sd.S_TermDate,
+            sd.P_CSPI_ID,
+            LAG( sd.S_TermDate) OVER (PARTITION BY sbsb_id order by   sd.S_EffDate) as prvTermDate,
+            DATE_ADD(LAG (sd.S_TermDate) OVER (PARTITION BY sbsb_id order by   sd.S_EffDate), 1) AS prvTermDate_plus1,
+            DATE_ADD(sd.S_EffDate,-1) as GAPEffDate,
+            DATE_ADD(sd.S_EffDate,1) as InEffDate,
+            CASE WHEN sd.S_TermDate < '2199-12-31' Then  DATE_ADD(sd.S_TermDate,-1) Else '2199-12-31' END as InTermDate
+            from sd_cs_pbp_dfTable sd
+            
+    """)
+    #df_gap.show()
+    show_dataframe_details(df_gap,"df_gap", displayCountFlag, 0, True)
+    df_gap.createOrReplaceTempView("gap_dfTable")
+    df_change_cond = spark.sql("""
+       Select *,
+         CASE WHEN prvTermDate_plus1 == sd.S_EffDate THEN 'RI'
+              WHEN prvTermDate_plus1 != sd.S_EffDate THEN 'RI'
+              WHEN prvTermDate_plus1 IS NULL THEN 'SL'
+              ELSE '' END 
+         AS EligType     
+         from gap_dfTable sd
+         """)
+    #df_change_cond.show()
+    show_dataframe_details(df_change_cond,"df_change_cond", displayCountFlag, 0, True)
+    df_change_cond.createOrReplaceTempView("change_cond_dfTable")
+    #######################################################################################
+    df_change_cond.createOrReplaceTempView("Change_cond_dfTable")
+    df_facets_sbel.show()
+    #sbel_dfTable
+    #
+    
+    df_sl_match = spark.sql(""" SELECT ch.sbsb_id as Sub_id,
+                                       ch.S_EffDate as S_EffDate,
+                                       1 as VC_SL 
+                                FROM Change_cond_dfTable ch 
+                                        INNER JOIN sbel_dfTable sb 
+                                         ON sb.SBSB_ID = ch.sbsb_id AND sb.SBEL_ELIG_TYPE = ch.EligType  AND ch.S_EffDate = sb.f_SBEL_EFF_DT
+                                Where  ch.P_CSPI_ID != sb.CSPI_ID AND sb.SBEL_ELIG_TYPE = 'SL' AND ch.EligType ='SL'
+    """)
+    df_sl_match.show()
+    
+    df_sl_match.createOrReplaceTempView("VC_SL_dfTable")
+    
+    df_change_cond = df_change_cond.join(df_sl_match, df_sl_match.Sub_id == df_change_cond.sbsb_id,"LEFT_OUTER" ) \
+                                   .select(df_change_cond["*"],df_sl_match["VC_SL"])
+    df_change_cond.show()
+    
+    df_gap  = df_gap.join(df_sl_match, df_sl_match.Sub_id == df_gap.sbsb_id,"LEFT_OUTER" ) \
+                                   .select(df_gap["*"],df_sl_match["VC_SL"])
+    df_gap.show()
+    df_gap.createOrReplaceTempView("gap_dfTable")
+    
+    df_voids = spark.sql("""
+    SELECT  Sub_id as sbsb_id,
+       DATEADD (DAY, -1000, S_EffDate) as Effdate,
+        '@pRECTYPE="SBEL",@pSBEL_UPDATE_CD="VC",@pSBEL_MCTR_VRSN_NVL="CE"'
+        As Concatresult
+        FROM VC_SL_dfTable 
+    UNION
+    select sbel.sbsb_id,
+       DATEADD (DAY, -1000, sbel.f_SBEL_EFF_DT) as Effdate,
+        CONCAT('@pRECTYPE="SBEL",@pSBEL_UPDATE_CD="VC",@pSBEL_EFF_DT="',date_format(sbel.f_SBEL_EFF_DT , 'MM/dd/yyyy'),
+                         '",@pSBEL_ELIG_TYPE="',sbel.SBEL_ELIG_TYPE,'",@pCSPD_CAT="M','",@pCSPI_ID="',sbel.CSPI_ID,'",@pSBEL_FI="C",@pSBEL_MCTR_VRSN_NVL="CE"')
+        As Concatresult
+    FROM sbel_dfTable sbel Left join gap_dfTable gap
+        ON gap.sbsb_id = sbel.sbsb_id AND (gap.VC_SL =0 OR gap.VC_SL IS NULL)
+        Left Join maxPBPTerm_dfTable mp
+        ON mp.MBINumber = gap.sbsb_id
+        Left Join minPBPEff_dfTable me
+        on me.MBINumber = gap.mbi
+       WHERE (sbel.f_SBEL_EFF_DT BETWEEN prvTermDate_plus1  and GAPEffDate ) OR (sbel.f_SBEL_EFF_DT > maxpbptermdate) OR  (sbel.f_SBEL_EFF_DT < minpbpeffdate) 
+       OR (sbel.f_SBEL_EFF_DT BETWEEN InEffDate  and InTermDate ) 
+       --AND prvTermDate_plus1 IS NOT NULL 
+       Order by Effdate
+    """)
+    #df_voids.show(truncate=False)
+    show_dataframe_details(df_voids,"df_voids", displayCountFlag, 0, False)
+    #df_voids = df_voids.withColumn('Concatresult', regexp_replace(col('Concatresult'), '\r\n$', ''))
+    df_voids.createOrReplaceTempView("void_dfTable")
+
+    df_nopbp_voids = spark.sql("""
+     SELECT sbel.sbsb_id as SID,
+          sd.effdate as EffDate ,
+                CONCAT_WS('\r\n', COLLECT_LIST(
+                    CONCAT('@pRECTYPE="SBEL",@pSBEL_UPDATE_CD="VC",@pSBEL_EFF_DT="',date_format(sbel.f_SBEL_EFF_DT, 'MM/dd/yyyy'),
+                               '",@pSBEL_ELIG_TYPE="',sbel.SBEL_ELIG_TYPE ,'",@pCSPD_CAT="M','",@pCSPI_ID="', sbel.CSPI_ID,'",@pSBEL_FI="C','",@pSBEL_MCTR_VRSN_NVL="CE','"')  
+                )) AS EffDateConcatResult
+            FROM sbel_dfTable sbel INNER JOIN  sd_cs_pbp_dfTable sd ON sbel.sbsb_id =sd.sbsb_id
+            WHERE sbel.SBEL_VOID_IND = 'N' and sbel.f_SBEL_EFF_DT >= to_date(concat(year(current_date())-1,'-01-01'), 'yyyy-MM-dd')
+                AND  (sd.MBINumber IS NULL OR TRIM(sd.MBINumber) ='') 
+            GROUP BY sbel.sbsb_id,  sd.effdate
+    """)
+    df_nopbp_voids.createOrReplaceTempView("nopbp_void_dfTable")
+    #df_nopbp_voids.show()
+    show_dataframe_details(df_nopbp_voids,"df_nopbp_voids", displayCountFlag, 0, True)
+    df_nopbp_voids = df_nopbp_voids.withColumn('EffDateConcatResult', regexp_replace(col('EffDateConcatResult'), '\r\n$', ''))
+
+    dfSql_sbelRecords  = spark.sql("""
+       SELECT 
+        cc.sbsb_id AS SID,
+        cc.S_EffDate as EffDate,
+        CASE WHEN 
+            MAX(CASE WHEN cc.S_EffDate = sbel.f_SBEL_EFF_DT AND cc.P_CSPI_ID = sbel.CSPI_ID AND (sbel.SBEL_ELIG_TYPE IN ( 'SL','CH', 'RI'))  THEN 1 ELSE 0 END) = 1 
+            THEN ''
+            ELSE
+              CASE WHEN  MAX(CASE WHEN cc.S_EffDate = sbel.f_SBEL_EFF_DT AND cc.P_CSPI_ID != sbel.CSPI_ID AND (sbel.SBEL_ELIG_TYPE IN ( 'SL','CH', 'RI'))  THEN 1 ELSE 0 END) = 1 
+                   THEN  CONCAT('@pRECTYPE="SBEL",@pSBEL_UPDATE_CD="IN",@pSBEL_EFF_DT="',date_format(cc.S_EffDate , 'MM/dd/yyyy'),'",@pSBEL_ELIG_TYPE="',cc.EligType,'",@pCSPD_CAT="M','",@pCSPI_ID="',cc.P_CSPI_ID,'",@pSBEL_FI="C','"') 
+                   ELSE CONCAT('@pRECTYPE="SBEL",@pSBEL_UPDATE_CD="IN",@pSBEL_EFF_DT="',date_format(cc.S_EffDate , 'MM/dd/yyyy'),'",@pSBEL_ELIG_TYPE="',cc.EligType,'",@pCSPD_CAT="M','",@pCSPI_ID="',cc.P_CSPI_ID,'",@pSBEL_FI="C','"')
+              END        
+         END AS EffDateConcatResult,
+        CASE WHEN  cc.S_TermDate < '2199-12-31' AND
+                   MAX(CASE WHEN cc.S_TermDate = sbel.f_SBEL_EFF_DT AND (sbel.SBEL_ELIG_TYPE IN ( 'TM'))  THEN 1 ELSE 0 END) = 1 
+            THEN CONCAT('@pRECTYPE="SBEL",@pSBEL_UPDATE_CD="IN",@pSBEL_EFF_DT="',date_format(cc.S_TermDate , 'MM/dd/yyyy'),'",@pSBEL_ELIG_TYPE="TM','",@pCSPD_CAT="M','",@pCSPI_ID="',cc.P_CSPI_ID,'",@pSBEL_FI="C','"')
+            ELSE
+                CASE WHEN  cc.S_TermDate < '2199-12-31' 
+                     THEN CONCAT('@pRECTYPE="SBEL",@pSBEL_UPDATE_CD="IN",@pSBEL_EFF_DT="',date_format(cc.S_TermDate , 'MM/dd/yyyy'),'",@pSBEL_ELIG_TYPE="TM','",@pCSPD_CAT="M','",@pCSPI_ID="',cc.P_CSPI_ID,'",@pSBEL_FI="C','"')
+                     ELSE ''
+                END        
+             END AS TermDateConcatResult    
+       FROM
+            change_cond_dfTable cc
+            LEFT JOIN  sbel_dfTable sbel  ON sbel.sbsb_id =cc.sbsb_id 
+        Group By cc.sbsb_id, cc.S_EffDate, cc.S_TermDate, cc.P_CSPI_ID, cc.EligType
+        Order by cc.S_EffDate 
+    """)
+    #dfSql_sbelRecords.show()
+    show_dataframe_details(dfSql_sbelRecords,"dfSql_sbelRecords", displayCountFlag, 0, True)
+    dfSql_sbelRecords.createOrReplaceTempView("sbelrecords_dfTable")
+    dfsql_sbelOutput = spark.sql("""
+    Select * from void_dftable
+    UNION
+    select SID,
+    EffDate,
+    concat_ws("\\r\\n", NULLIF(EffDateConcatResult,''), NULLIF(TermDateConcatResult,'') ) as  recordsConcatresult 
+    from sbelrecords_dfTable Group by SID, EffDateConcatResult, TermDateConcatResult, EffDate
+    UNION
+    select * from nopbp_void_dfTable
+    order by EffDate
+    """)
+    dfsql_sbelOutput =dfsql_sbelOutput.withColumn('Concatresult', regexp_replace(col('Concatresult'), '\r\n$', ''))
+    #dfsql_sbelOutput.show(truncate=False)
+    show_dataframe_details(dfsql_sbelOutput,"dfsql_sbelOutput", displayCountFlag, 0, False)
+    dfsql_sbelOutput.createOrReplaceTempView("sbelOutRecords_dfTable")
+    dfsql_sbelOutputA = spark.sql("""
+    Select "SBEL" as Type, sbsb_id AS SID, 
+    
+            CONCAT_WS("\\r\\n", COLLECT_LIST(
+                NULLIF(Concatresult,'') 
+            )) AS SBELA_ConcatResult
+    FROM sbelOutRecords_dfTable 
+    Group By sbsb_id
+    
+    """)
+    dfsql_sbelOutputA =dfsql_sbelOutputA.withColumn('SBELA_ConcatResult', regexp_replace(col('SBELA_ConcatResult'), '\r\n$', ''))
+    #dfsql_sbelOutputA.show(truncate=False)
+    show_dataframe_details(dfsql_sbelOutputA,"dfsql_sbelOutputA", displayCountFlag, 0, False)
+    #================================================================
+    #=======   CHANGE MEMBER Condition Based on FACETS =============
+    #==============================================================
+
+    df_new_changeMember = spark.sql("""
+      SELECT sd.*, CASE WHEN COUNT(fs.sbsb_id) > 0  THEN 1 ELSE 0 END as changemember
+       FROM sd_cs_dfTable sd LEFT JOIN facets_SubMem_dfTable fs 
+        ON sd.sbsb_id = fs.sbsb_id AND TRIM(sd.GRGR_ID) = TRIM(fs.grgr_id)
+       Group By sd.sbsb_id,sd.alt_sbsb_id, sd.lastname, sd.firstname, sd.salutation, sd.middleinitial, sd.sex, sd.mbi, sd.planid, 
+          sd.pbpid, sd.effectivedate,sd.effdate,sd.tmdate,sd.termdate,sd.ap_date_effectivedate,sd.memberPresent,sd.address1,sd.address2,sd.city,sd.state,
+          sd.zip,sd.phone,sd.address2_1,sd.address2_2,sd.city2,sd.state2,sd.zip2,
+          sd.phone2,sd.email,sd.Prem_Withhold_opt,sd.PartCPremium ,sd.PartDPremium ,sd.LEPAmount,sd.PCPFirstName,sd.PCPLastName,sd.PCPID,sd.PCPNPI,
+          sd.CSPI_ID, sd.CSCS_ID, sd.productID, sd.GRGR_ID, sd.SGSG_ID,sd.SubEmpty,sd.hasPBPMbi,sd.flag_hasPBPMbi,sd.Segment_ID, sd.ProductSuite, sd.egwpNumber,
+          sd.plan5_effectivedate, sd.medicaid
+    """)
+    #df_new_changeMember.show(truncate=False)
+    show_dataframe_details(df_new_changeMember,"df_new_changeMember", displayCountFlag, 0, False)
+
+    NewMemberNoPBP_df = df_new_changeMember.filter((F.col('changemember')==0) & (F.col('flag_hasPBPMbi')==1)).select(F.col('mbi'), F.col('sbsb_id'))
+    show_dataframe_details(NewMemberNoPBP_df,"NewMemberNoPBP_df", displayCountFlag, NewMemberNoPBP_df.count(), False)
+
+    df_new_changeMember.createOrReplaceTempView("sd_cs_final_dfTable")
+    #============================================================================
+    ########################## SBRT Data ########################################
+    #============================================================================
+    from pyspark.sql.functions import  concat
+    try:
+        show_dataframe_details(lics_span_df,"lics_span_df", displayCountFlag, 0, True)
+        lis_sbrt_df = lics_span_df.select(['MBI','LIS_LEVEL','Subsidy_Amt','Start_Dt','End_Dt']).orderBy('Start_Dt')
+        lis_sbrt_df.createOrReplaceTempView("lis_sbrt_dfTable")
+        gap_sbrt_df = spark.sql(""" WITH prevRecordSbrt AS (
+                                      SELECT MBI, 
+                                          LIS_LEVEL,
+                                          Subsidy_Amt,
+                                          Start_Dt,
+                                          End_Dt,
+                                          LAG( End_Dt) OVER (PARTITION BY MBI order by   Start_Dt) as prvEndDate,
+                                          DATE_ADD(LAG( End_Dt) OVER (PARTITION BY MBI order by   Start_Dt), 1) AS prvEndDate_plus1
+                                      FROM lis_sbrt_dfTable
+                                      ),
+                                      
+                                    gap_records AS (
+                                      SELECT MBI, 
+                                          0 AS LIS_LEVEL,
+                                          0.0 AS Subsidy_Amt,
+                                          prvEndDate_plus1  AS  Start_Dt,
+                                          DATE_SUB(Start_Dt,1) AS End_Dt
+                                        FROM prevRecordSbrt
+                                        WHERE prvEndDate_plus1 IS NOT NULL
+                                           AND prvEndDate_plus1 != Start_Dt
+                                           )
+                                     SELECT  MBI, 
+                                          LIS_LEVEL,
+                                          Subsidy_Amt,
+                                          Start_Dt,
+                                          End_Dt  
+                                     FROM  prevRecordSbrt
+                                    UNION ALL
+                                     SELECT  MBI, 
+                                          LIS_LEVEL,
+                                          Subsidy_Amt,
+                                          Start_Dt,
+                                          End_Dt  
+                                    FROM gap_records
+                                    ORDER BY MBI, Start_Dt
+        
+        """)
+        show_dataframe_details(gap_sbrt_df,"gap_sbrt_df Show", displayCountFlag, 0, True)
+
+        eam_span_df.createOrReplaceTempView("eam_span_df_dfTable")
+        max_pbp_term_df = spark.sql("""
+                    select MBINumber as MBINum , MAX(S_TermDate) AS maxpbptermdate from  eam_span_df_dfTable WHERE TRIM(SType) ='PBP' group by  MBINumber
+                    """)
+        min_pbp_eff_df = spark.sql("""
+                 select MBINumber as MBINum, MIN(S_EffDate) AS minpbpeffdate from  eam_span_df_dfTable WHERE TRIM(SType) ='PBP' group by  MBINumber
+                   """)
+        show_dataframe_details(max_pbp_term_df,"max_pbp_term_df Show", displayCountFlag, 0, True)
+        show_dataframe_details(min_pbp_eff_df,"min_pbp_eff_df Show", displayCountFlag, 0, True)
+        max_pbp_term_df.createOrReplaceTempView("max_pbp_term_dfTable")
+        min_pbp_eff_df.createOrReplaceTempView("min_pbp_eff_dfTable")
+        gap_sbrt_df.createOrReplaceTempView("gap_sbrt_dftable")
+        max_lis_enddt_df = spark.sql("""
+                  select MBI, MAX(End_Dt) AS maxlicstermdate from  gap_sbrt_dftable group by  MBI
+                 """)
+        min_lis_effdt_df = spark.sql("""
+                  select MBI, MIN(Start_Dt) AS minlicseffdate from  gap_sbrt_dftable WHERE  group by  MBI
+                  """)
+        show_dataframe_details(min_lis_effdt_df,"min_lis_effdt_df Show", displayCountFlag, 0, True)
+        show_dataframe_details(max_lis_enddt_df,"max_lis_enddt_df Show", displayCountFlag, 0, True)
+
+        combined_minmax_df = min_lis_effdt_df.alias("min_lics").join(max_lis_enddt_df.alias("max_lics"),on ="MBI",how="left") \
+            .join(min_pbp_eff_df.alias("min_pbp"),min_pbp_eff_df.MBINum==min_lis_effdt_df.MBI,how="left") \
+            .join(max_pbp_term_df.alias("max_pbp"),max_pbp_term_df.MBINum==min_lis_effdt_df.MBI,how="left") \
+            .select(col("min_lics.MBI"),col("min_lics.minlicseffdate"),col("max_lics.maxlicstermdate"),col("min_pbp.minpbpeffdate"),col("max_pbp.maxpbptermdate"))
+        show_dataframe_details(combined_minmax_df,"combined_minmax_df Show", displayCountFlag, 0, True)
+        updated_com_minmax_df = combined_minmax_df.withColumn("eff_minPbpToLisgap",when(col("minpbpeffdate")<col("minlicseffdate"),1).otherwise(0)) \
+            .withColumn("term_maxLisToPbpgap",when(col("maxlicstermdate")<col("maxpbptermdate"),1).otherwise(0))
+        show_dataframe_details(updated_com_minmax_df,"updated_com_minmax_df Show", displayCountFlag, 0, True)
+        updated_com_minmax_df.createOrReplaceTempView("up_com_minmax_table")
+
+        end_gap_df = spark.sql("""WITH effDate_Gap AS (
+                                       SELECT MBI, 
+                                          0 AS LIS_LEVEL,
+                                          0.0 AS Subsidy_Amt,
+                                          minpbpeffdate  AS  Start_Dt,
+                                          DATE_SUB(minlicseffdate,1) AS End_Dt
+                                        FROM up_com_minmax_table
+                                        WHERE eff_minPbpToLisgap = 1
+                                        ),
+                                    termDate_Gap AS (
+                                        SELECT MBI, 
+                                          0 AS LIS_LEVEL,
+                                          0.0 AS Subsidy_Amt,
+                                          DATE_ADD(maxlicstermdate,1)  AS  Start_Dt,
+                                          maxpbptermdate AS End_Dt
+                                        FROM up_com_minmax_table
+                                        WHERE term_maxLisToPbpgap = 1
+                                        )
+                                        
+                                     SELECT * FROM effDate_Gap
+                                     UNION
+                                     SELECT * FROM termDate_Gap
+                                     UNION
+                                     SELECT * FROM  gap_sbrt_dfTable
+                                     Order by MBI
+        
+        """)
+        show_dataframe_details(end_gap_df,"end_gap_df Show", displayCountFlag, 0, True)
+        end_gap_df.createOrReplaceTempView("end_gap_dfTable")
+
+
+        lis_sbrt_df = spark.sql("""Select *,
+        CASE WHEN LIS_LEVEL in (0, 00, 000)THEN 'NOLIS'
+             WHEN LENGTH(LIS_LEVEL) < 3 THEN CONCAT('LIS', LPAD(LIS_LEVEL,3,0))
+             ELSE CONCAT('LIS',LIS_LEVEL ) 
+             END AS LISLEVEL
+             FROM end_gap_dfTable
+        """)
+        lis_sbrt_df= subData_df.join(lis_sbrt_df, subData_df.mbi == lis_sbrt_df.MBI, "left_outer") \
+            .select(lis_sbrt_df["*"],subData_df["sbsb_id"])
+        show_dataframe_details(lis_sbrt_df,"lis_sbrt_df Show", displayCountFlag, 0, True)
+        Subdata_lis = subData_df
+        Subdata_lis.createOrReplaceTempView("Sub_data_lis")
+        Missing_lics_df = spark.sql(""" Select s.MBI, 0 as LIS_LEVEl, 0 as Subsidy_Amt,  minP.minpbpeffdate as Start_Dt, maxP.maxpbptermdate as End_Dt,'NOLIS' as LISLEVEL, s.sbsb_id
+                                        FROM Sub_data_lis s LEFT JOIN min_pbp_eff_dfTable minP ON minP.MBINum = s.MBI
+                                                        LEFT JOIN max_pbp_term_dfTable maxP ON maxP.MBINum = s.MBI
+                                        WHERE s.MBI not in (SELECT DISTINCT MBI FROM end_gap_dfTable )                
+        """)
+        show_dataframe_details(Missing_lics_df,"Missing_lics_df Show", displayCountFlag, 0, True)
+        lis_sbrt_df = lis_sbrt_df.union(Missing_lics_df)
+        show_dataframe_details(lis_sbrt_df,"lis_sbrt_df Show", displayCountFlag, 0, True)
+        lis_sbrt_df.createOrReplaceTempView("lis_sbrt_dftable")
+    except Exception as err:
+        #print(err)
+        logger.error(f"FCT_EAMFCTMMS: ERROR: Error occured in creating facets SBRT keywords : {err}")
+    #df_excel_pc.dtypes
+
+    pcp_final = None
+    try:
+        #==========================================================
+        #============  MEPR Lat long logic =======================
+        #=========================================================
+        #====================================
+        ##SECRETS FOR MEM LAT AND LONG
+
+        #boto3_session = boto3.session.Session()
+        lat_secret_client = boto3_session.client(
+            service_name='secretsmanager',
+            region_name='us-east-1'
+        )
+        get_lat_secret_response = lat_secret_client.get_secret_value(SecretId=_locationapi_secret_name)
+        secrets_payload = ''
+        if 'SecretString' in get_lat_secret_response:
+            lat_secret = get_lat_secret_response['SecretString']
+            secret_dict = json.loads(lat_secret)
+            #print(secret_dict)
+            #secret_dict['client_id'], secret_dict['client_secret']
+            #payload = f"grant_type=client_credentials&client_id={secret_dict['client_id']}&client_secret={secret_dict['client_secret']}"
+
+            secret_dict['grant_type'] = 'client_credentials'
+            secrets_payload = urllib.parse.urlencode(secret_dict)
+            #secrets_payload = f"grant_type=client_credentials&client_id={secret_dict['client_id']}&client_secret={urllib.parse.quote(secret_dict['client_secret'])}"
+            #secret_dict['client_secret'] = secret_dict['client_secret'].replace("/", "%2F")
+        #print(secrets_payload)
+
+
+        ## Adding latittude and longitude for PCP lookup##
+        #sd_df_with_CS.show()
+        show_dataframe_details(sd_df_with_CS,"sd_df_with_CS", displayCountFlag, 0, True)
+
+        A_pcp_lookup_input_df= sd_df_with_CS
+
+        A_pcp_lookup_input_df = A_pcp_lookup_input_df.filter(F.col('PCPID') == '')
+        show_dataframe_details(A_pcp_lookup_input_df,"A_pcp_lookup_input_df", displayCountFlag, 0, True)
+
+        pcp_lookup_input_df= A_pcp_lookup_input_df.join(df_change_cond.filter(F.expr("EligType IN ('SL','RI','CH')")), on='sbsb_id') \
+            .select(A_pcp_lookup_input_df["*"]).distinct()
+
+        #pcp_lookup_input_df.show()
+        show_dataframe_details(pcp_lookup_input_df,"pcp_lookup_input_df", displayCountFlag, 0, True)
+
+        # selecting columns used to call location api
+        sub_data_address = pcp_lookup_input_df.select('sbsb_id', 'address1', 'address2', 'city', 'state', 'zip')
+
+        # PayLoad for Lat and Long API
+        locationPayload = F.struct(
+            F.col('sbsb_id').alias('addressRequestMatchingId'),
+            F.array(
+                F.col('address1'),
+                F.col('address2')
+            ).alias('streetAddresses'),
+            F.col('city').alias('city'),
+            F.col('state').alias('stateCode'),
+            F.col('zip').alias('postalCode')
+        )
+
+        sub_data_address = sub_data_address.withColumn('locationPayload', F.to_json(locationPayload))
+        #sub_data_address.show(10)
+        show_dataframe_details(sub_data_address,"sub_data_address", displayCountFlag, 10, True)
+
+        # paritioning the data into batch of 100 to call lcoation api
+        if sub_data_address.count() > 0:
+            num_records = sub_data_address.count()
+            batch_size = 100
+            num_partitions = (num_records // batch_size) + (1 if num_records % batch_size != 0 else 0)
+            sub_data_repartioned = sub_data_address.repartition(num_partitions)
+            logger.info(num_partitions)
+
+        
+        logger.info('Token call Start')
+        ##Change to secrets
+        # get barer token for LatLongAPI
+        # get barer token for LatLongAPI
+        def generate_token():
+
+            headers = {
+                'Content-Type' : 'application/x-www-form-urlencoded',
+                #'Cookie' : 'JSESSIONID=425EEF8FA077161B96011949205FE70A'
+            }
+
+            response = requests.request("POST", _location_api_auth_url, headers=headers, data=secrets_payload)
+            #print('Toekn Response', response, secrets_payload)
+            if response.status_code == 200:
+
+                return response.json()['access_token']
+            return ''
+
+
+        # function to fetch location data in batch of 100
+        #access_token = generate_token()
+
+        def get_locations(address_list):
+            logger.info('test get_locations')
+            access_token = None
+
+            if access_token is None:
+                access_token = generate_token()
+            ct = 0
+            #url = "https://api-dev.express-scripts.io/location-intelligence/v1/addresses/$validate"
+            api_payload = json.dumps({"postalAddresses": address_list})
+            headers = {
+                'X-JWT-Assertion': access_token,
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {access_token}'
+            }
+
+            response = requests.request("POST", _location_api_url, headers=headers, data=api_payload, verify='combined.pem')
+            #print(response)
+            #logger.info(f'response : {response}')
+            if response.status_code == 200:
+                return response.json()['postalAddresses']
+            if response.status_code == 401:
+                ct += 1
+                if ct > 5:
+                    raise Exception('final counter exceeded')
+                access_token = None
+                return get_locations(address_list)
+            return []
+
+
+        # processing request and response for location data in batches
+        def fetch_address_in_batch(batch):
+            logger.info('fetch_address_in_batch')
+            rows = []
+            data = []
+            sbsb_id = {}
+            ct = 0
+            for row in batch:
+                ct += 1
+                sbsb_id[ct] = row.sbsb_id
+                payload = {
+                    "addressRequestMatchingId": ct,
+                    "streetAddresses": [],
+                    "city": row.city,
+                    "stateCode": row.state,
+                    "postalCode": row.zip
+                }
+                if row.address1 != "":
+                    payload['streetAddresses'].append(row.address1)
+                if row.address2 != "":
+                    payload['streetAddresses'].append(row.address2)
+                data.append(payload)
+            loc_response = get_locations(data)
+
+            for resp in loc_response:
+                lat = 0
+                long = 0
+                if 'validationInfoMessages' in resp:
+                    codes = [code['code'] for code in resp['validationInfoMessages']]
+                    if 'LOCINT20008' in codes or 'LOCINT20009' in codes:
+                        if 'geoCoordinates' in resp:
+                            lat = float(resp['geoCoordinates']['latitude']) if resp['geoCoordinates']['latitude'] is not None else 0
+                            long = float(resp['geoCoordinates']['longitude']) if resp['geoCoordinates']['longitude'] is not None else 0
+                x = Row(sbsb_id=sbsb_id[resp['addressRequestMatchingId']], latitude=lat, longitude=long)
+
+                rows.append(x)
+            return rows
+
+        logger.info('Start batched_data')
+        # running the function in batches
+        # suppose 1000 of address are there it will create 10 partition batch and run each parittion to fetch location data
+        batched_data = sub_data_repartioned.rdd.mapPartitions(fetch_address_in_batch)
+        location_df = spark.createDataFrame(batched_data)
+        location_df =location_df.withColumn("latitude", when(col("latitude").isNull(),0).otherwise(col("latitude"))) \
+            .withColumn("longitude", when(col("longitude").isNull(),0).otherwise(col("longitude")))
+        #location_df.show()
+        show_dataframe_details(location_df,"location_df", displayCountFlag, 0, True)
+
+        # join data with location latitude and longitude
+        subsetDf_with_location = pcp_lookup_input_df.join(location_df, on='sbsb_id', how='left')
+
+
+        ## GET facets scereests data##
+        #facets_secret_name = "/gbs/dev2/facets/rds/svtdmomfacetsenrollment"
+        #_facetsSecretsAccount = '763731808649'
+        #_facetsRegion = 'us-east-1'
+        dbname = 'facetsdb'
+        facets_secret_name = f"arn:aws:secretsmanager:{_facets_region}:{_facetssecrets_account_ID}:secret:{_facets_secrets_name}"
+
+        #facets_secret_name = "gov-solutions-dmom-dev-fct-facetsenroll-creds"
+        #boto3_session = boto3.session.Session()
+
+        secrets_client = boto3_session.client(
+            service_name='secretsmanager',
+            region_name='us-east-1'
+        )
+        facets_secret = json.loads(secrets_client.get_secret_value(
+            SecretId=facets_secret_name
+        )['SecretString'])
+
+        #print(facets_secret)
+
+        #server_name = "jdbc:sqlserver://" + facets_secret['host']
+        #database_name = "facets_GBS"
+        #url = server_name + ";" + "databaseName=" + database_name + ";"
+        username = facets_secret['username']
+        password = facets_secret['password']
+
+
+
+        # selecting final columcs for pcp lookup stored procedure query
+        prpr_subset_data = subsetDf_with_location.select('sb.sbsb_id', 'GRGR_ID', 'CSCS_ID', 'CSPI_ID', 'sb.effectivedate', 'sb.effdate', 'zip', 'latitude', 'longitude', 'PCPFirstName',
+                                                         'PCPLastName', 'memberPresent', 'PCPNPI')
+
+        #prpr_subset_data.show()
+        show_dataframe_details(prpr_subset_data,"prpr_subset_data", displayCountFlag, 0, True)
+
+        # adding stored procedure based on user nfirst and lastname
+
+        prpr_subset_data = prpr_subset_data.withColumn('sp_name', F.when(
+            (((F.col('PCPFirstName') != '') & (F.col('PCPLastName') != '')) | (F.col('PCPNPI') !='')) , '[dbo].[spPCPLookup]').otherwise('[dbo].[spPCPSuggestion]'))
+
+        #prpr_subset_data.show()
+        show_dataframe_details(prpr_subset_data,"prpr_subset_data", displayCountFlag, 0, True)
+
+
+
+
+
+        # processing function to create sotred procedure details
+        prpr_subset_data_rdd = prpr_subset_data.rdd.map(lambda row: create_stored_params(row))
+
+
+        # creating connectiona and calling stored procedure
+        driver_manager = spark._sc._gateway.jvm.java.sql.DriverManager
+        con = driver_manager.getConnection(fac_pcp_sp_db_url, username, password)
+        #connection, sbsb_id, sp_name, sp_parameters
+
+        rows = []
+        for item in prpr_subset_data_rdd.toLocalIterator():
+            sbsb_id, sp_name, args = item
+            #print(f"con:{con},sbsb_id:{sbsb_id},sp_name:{sp_name},args:{args}")
+            logger.info(f"con:{con},sbsb_id:{sbsb_id},sp_name:{sp_name},args:{args}")
+            result = execute_sql_storedproc(con, sbsb_id, sp_name, args)
+            rows.extend(result)
+
+        con.close()
+
+        #creating schema for pcplookup value
+        pcp_schema = StructType([StructField('sbsb_id', StringType(), True), StructField('prpr_result', StringType(), True), StructField('error', StringType(), True)])
+        df = spark.createDataFrame(rows, schema=pcp_schema)
+        #df.show()
+        show_dataframe_details(df,"df", displayCountFlag, 0, True)
+
+        pcp_final = prpr_subset_data.join(df, on='sbsb_id')
+        pcp_final = pcp_final.dropDuplicates(subset=['sbsb_id', 'error'])
+        #pcp_final.show()
+        show_dataframe_details(pcp_final,"pcp_final", displayCountFlag, 0, True)
+
+
+    except Exception as err:
+        import traceback
+        traceback.print_exc()
+        logger.error(f'error : {err}')
+    ########################################################
+    ############# KeyWord generation ########################
+    ########################################################
+
+    #import concat from functions
+    from  pyspark.sql.functions import concat
+    try:
+        subData_df.createOrReplaceTempView("SD_dfTable")
+        #productInfo_sql.createOrReplaceTempView("PC_dfTable")
+
+        #######  SBSB KeyWord  ################
+        dfSql_sbsb = spark.sql("""  SELECT "SBSB" as Type, sbsb_id AS SID, 
+             CONCAT('@pRECTYPE="SBSB",@pSBSB_FAM_UPDATE_CD="', 
+                CASE
+                  WHEN SubEmpty = 1 OR GRGR_ID ='' OR GRGR_ID IS NULL THEN 'ER'
+                  WHEN SubEmpty =0 AND changemember = 1 THEN 'AP' 
+                  ELSE 'IN' END,
+              '",@pMERA_IND="N",@pSBSB_ID="',SBSB_ID,
+              CASE WHEN  GRGR_ID IS NOT NULL OR GRGR_ID <> '' THEN CONCAT('",@pGRGR_ID="',GRGR_ID) ELSE '",@pGRGR_ID="' END,
+              '",@pSBSB_LAST_NAME="',lastname,
+              '",@pSBSB_FIRST_NAME="', firstname,
+              '",@pSBSB_MID_INIT="',middleInitial,
+              '",@pSBSB_TITLE="',salutation,
+              '",@pSBSB_ORIG_EFF_DT="',CASE WHEN ap_date_effectiveDate>plan5_effectiveDate AND TRIM(plan5_effectiveDate) IS NOT NULL AND TRIM(plan5_effectiveDate) <> '' 
+                                            THEN date_format(plan5_effectiveDate , 'MM/dd/yyyy') 
+                                            ELSE date_format(ap_date_effectiveDate , 'MM/dd/yyyy') END,
+              '",@pSBSB_MCTR_STS="ACTI',
+              '",@pSBSB_EMPLOY_ID="',
+              '",@pSBAD_TYPE_HOME="H',
+              '",@pSBAD_TYPE_MAIL="',CASE WHEN TRIM(address2_1) IS NOT NULL AND TRIM(address2_1) <> '' THEN 'M' ELSE 'H' END,
+              '",@pSBSB_SIG_DT="',date_format(ap_date_effectiveDate , 'MM/dd/yyyy'),
+              CASE WHEN changemember = 0 THEN  CONCAT('",@pSBSB_RECD_DT="',date_format(ap_date_effectiveDate , 'MM/dd/yyyy')) ELSE '' END,
+              '",@pSBSB_PAY_CL_METH="D',
+              '",@pINPUT_METHOD="P"')
+            AS SBSB_ConcatResult
+            FROM sd_cs_final_dfTable
+            WHERE flag_hasPBPMbi = 0 OR changemember = 1
+        """)
+        #dfSql_sbsb.show()
+        show_dataframe_details(dfSql_sbsb,"dfSql_sbsb", displayCountFlag, 0, True)
+
+        #######  SBEL KeyWord  ################
+        dfsql_sbelOutputA.createOrReplaceTempView("sbelA_dfTable")
+        #dfSql_sbelA.createOrReplaceTempView("sbelA_dfTable")
+        dfSql_sbel  = spark.sql("""
+          SELECT "SBEL" as Type, sd.sbsb_id AS SID,
+            CASE WHEN (sbela.SBELA_ConcatResult IS NOT NULL OR sbela.SBELA_ConcatResult <> '') AND (sd.changemember = 1) THEN sbela.SBELA_ConcatResult
+                WHEN sd.changemember = 0 THEN
+                 CONCAT('@pRECTYPE="SBEL",@pSBEL_UPDATE_CD="IN",@pSBEL_EFF_DT="',date_format(sd.effdate , 'MM/dd/yyyy'),'",@pSBEL_ELIG_TYPE="SL','",@pCSPD_CAT="M','",@pCSPI_ID="',sd.CSPI_ID,'",@pSBEL_FI="C','"')
+                ELSE '' END
+            AS SBEL_ConcatResult
+          FROM sd_cs_final_dfTable sd LEFT JOIN  
+          sbelA_dfTable sbela ON sbela.SID = sd.sbsb_id 
+        """)
+
+        #dfSql_sbel.show()
+        show_dataframe_details(dfSql_sbel,"dfSql_sbel", displayCountFlag, 0, True)
+
+
+        #######    SBAD KeyWord   ################
+        dfSql_sbad = spark.sql("""  SELECT "SBAD" as Type, sbsb_id AS SID,
+        CONCAT(
+             CASE  WHEN TRIM(address1) IS NOT NULL AND TRIM(address1) <> '' THEN 
+               CONCAT('@pRECTYPE="SBAD",@pSBAD_UPDATE_CD="', CASE WHEN changemember = 1 THEN 'AP' ELSE 'IN' END,
+              '",@pSBAD_TYPE="H",@pADDR1="',address1,
+              '",@pCITY="',city,
+              '",@pSTATE="',state,
+              '",@pZIP="', REPLACE(zip,'-',''),
+              '",@pCTRY_CD="',"USA",
+              '",@pPHONE="',phone,
+              '",@pEMAIL="',email,'"')
+                  ELSE ''
+                  END,
+             CASE WHEN TRIM(address1) IS NOT NULL AND TRIM(address1) <> '' AND TRIM(address2_1) IS NOT NULL AND TRIM(address2_1) <> '' THEN '\r\n'
+                       ELSE ''
+                       END,
+             CASE WHEN TRIM(address2_1) IS NOT NULL AND TRIM(address2_1) <> '' THEN 
+               CONCAT('@pRECTYPE="SBAD",@pSBAD_UPDATE_CD="', CASE WHEN changemember = 1 THEN 'AP' ELSE 'IN' END,
+            '",@pSBAD_TYPE="M",@pADDR1="',address2_1,
+            '",@pCITY="',city2,
+            '",@pSTATE="',state2,
+            '",@pZIP="', REPLACE(zip2,'-',''),
+            '",@pCTRY_CD="',"USA",
+            '",@pPHONE="',phone2,
+            '",@pEMAIL="',email,'"')
+            ELSE ''
+            END 
+            )  
+            AS SBAD_ConcatResult
+            FROM sd_cs_final_dfTable sb 
+        """)
+        #dfSql_sbad.show()
+        show_dataframe_details(dfSql_sbad,"dfSql_sbad", displayCountFlag, 0, True)
+
+
+        #######     SBSC KeyWord    ################
+        
+        pbp_sbsc_df = df_new_changeMember.join(pbp_eam_span_df, pbp_eam_span_df.MBINumber == subData_df.mbi, "left_outer")
+        show_dataframe_details(pbp_sbsc_df,"pbp_sbsc_df", displayCountFlag, 0, True)
+        pbp_sbsc_df.createOrReplaceTempView("pbp_sbsc_dfTable")
+        
+        dfSql_sbcs = spark.sql("""SELECT "SBCS" as Type, sbsb_id AS SID, S_EffDate,
+         CONCAT('@pRECTYPE="SBCS",@pSBCS_UPDATE_CD="', CASE WHEN changemember =1 THEN 'AP' ELSE 'IN' END,
+             '",@pSBCS_EFF_DT="',date_format(S_EffDate, 'MM/dd/yyyy'),
+             CASE WHEN  P_CSCS_ID IS NOT NULL OR P_CSCS_ID <> ''THEN CONCAT('",@pCSCS_ID="', P_CSCS_ID) ELSE '",@pCSCS_ID="' END,
+              '"')
+             AS SBCS_ConcatResult
+          FROM pbp_sbsc_dfTable 
+        """)
+        #dfSql_sbcs.show()
+        show_dataframe_details(dfSql_sbcs,"dfSql_sbcs", displayCountFlag, 0, True)
+
+        #######     SBSG KeyWord    ################
+        dfSql_sbsg = spark.sql("""SELECT "SBSG" as Type, sbsb_id AS SID, S_EffDate, 
+            CONCAT('@pRECTYPE="SBSG",@pSBSG_UPDATE_CD="', CASE WHEN changemember = 1 THEN 'AP' ELSE 'IN' END,
+              '",@pSBSG_EFF_DT="',date_format(S_EffDate, 'MM/dd/yyyy'),
+               CASE WHEN  P_SGSG_ID IS NOT NULL OR P_SGSG_ID <> ''THEN  CONCAT('",@pSGSG_ID="', P_SGSG_ID) ELSE '",@pSGSG_ID="' END,
+             '"')
+           AS SBSG_ConcatResult
+           FROM pbp_sbsc_dfTable 
+        """)
+        #dfSql_sbsg.show()
+        show_dataframe_details(dfSql_sbsg,"dfSql_sbsg", displayCountFlag, 0, True)
+
+        #######   SBSR KeyWord    ################
+        dfSql_sbsr = spark.sql("""SELECT "SBSR" as Type, sbsb_id AS SID, 
+             CONCAT('@pRECTYPE="SBSR",@pSBSR_UPDATE_CD="', CASE WHEN changemember = 1 THEN 'AP' ELSE 'IN' END,
+              '",@pSBSR_TYPE="O",@pPDPD_ID="',productID,
+              '",@pPDBL_ID="LEP',
+              '",@pPDRT_TYPE="C',
+              '",@pSBSR_EFF_DT="',effectivedate,
+              '",@pSBSR_BASIS="12',
+              '",@pSBSR_PREM_SB=',LEPAmount
+              )
+            AS SBSR_ConcatResult
+            FROM sd_cs_final_dfTable
+            WHERE LEPAmount <> ''  
+        """)
+        #dfSql_sbsr.show()
+        show_dataframe_details(dfSql_sbsr,"dfSql_sbsr", displayCountFlag, 0, True)
+
+        #################### SBRT Keyword ###################################
+
+        dfSql_sbrt = spark.sql("""  SELECT "SBRT" as Type, LisTable.sbsb_id as SID,
+               CONCAT_WS("\\r\\n", COLLECT_LIST(
+                CONCAT('@pRECTYPE="SBRT",@pSBRT_UPDATE_CD="AP',
+             '",@pSBSB_ID="',LisTable.sbsb_id,
+             '",@pSBRT_EFF_DT="',date_format(LisTable.Start_Dt, 'MM/dd/yyyy') ,
+             '",@pSBRT_TERM_DT="',date_format(LisTable.End_Dt, 'MM/dd/yyyy'),
+             '",@pSBRT_SMOKER_IND="N',
+             '",@pSBRT_RT_AREA="',LisTable.LISLEVEL,'"')
+             ))
+             AS SBRT_ConcatResult
+             FROM lis_sbrt_dftable LisTable
+             GROUP BY sbsb_id
+        """)
+        #dfSql_sbrt.show()
+        show_dataframe_details(dfSql_sbrt,"dfSql_sbrt", displayCountFlag, 0, True)
+        dfSql_sbrt.createOrReplaceTempView("SBRT_OutputTable")
+
+        ################### BLEI Keyword ###################################
+
+        dfSql_bleiA.createOrReplaceTempView("blei_TableA")
+        dfSql_blei = spark.sql("""SELECT "BLEI" as Type, 
+          b.SID,
+          b.BLEI_ConcatResult
+         FROM blei_TableA b Left join sd_cs_final_dfTable sc
+         ON b.SID = sc.sbsb_id
+         WHERE  changemember = 0
+         """)
+        show_dataframe_details(dfSql_blei,"dfSql_blei", displayCountFlag, 0, True)
+
+    except Exception as err:
+
+        logger.error(f'Error occured in creating facets Subscriber level keywords : {err}')
+        #print(err)
+        logging.info("FCT_EAMFCTMMS: ERROR: Error occured in creating facets keywords")
+
+    #=========================================================
+    #######   MEME KeyWord    ################
+    try:
+        memData_df =memData_df.join(eth_df, eth_df.MBINumber == memData_df.mbi, "LEFT_OUTER") \
+            .select(memData_df["*"], eth_df["eth_value"])
+        memData_df =memData_df.join(race_df, race_df.MBINumber ==memData_df.mbi, "LEFT_OUTER") \
+            .select(memData_df["*"], race_df["race_value"])
+        memData_df.createOrReplaceTempView("meme_dfTable")
+        dfSql_meme = spark.sql("""SELECT 'MEME' as Type,  m.sbsb_id AS SID,
+        CONCAT('@pRECTYPE="MEME",@pMEME_UPDATE_CD="',CASE WHEN s.changemember =1 THEN 'AP' ELSE 'IN' END,
+        '",@pMEME_REL="M",@pMEME_LAST_NAME="',m.lastname,
+        '",@pMEME_FIRST_NAME="',m.firstname,
+        '",@pMEME_MID_INIT="',m.middleinitial,
+        '",@pMEME_TITLE="', m.salutation,
+        '",@pMEME_ORIG_EFF_DT="',CASE WHEN m.ap_date_effectivedate>m.plan5_effectiveDate AND TRIM(m.plan5_effectiveDate) IS NOT NULL AND TRIM(m.plan5_effectiveDate) <> '' 
+                               THEN date_format(m.plan5_effectiveDate , 'MM/dd/yyyy') 
+                               ELSE date_format(m.ap_date_effectiveDate , 'MM/dd/yyyy') END,
+        '",@pMEME_SSN="',m.ssn,
+        '",@pMEME_SEX="',m.sex,
+        '",@pMEME_BIRTH_DT="',m.dob,
+        '",@pMEME_MCTR_LANG="',m.language,
+        '",@pMEME_RECORD_NO="',m.med_rec_num,
+        '",@pMEME_MARITAL_STATUS="',m.maritalstatus,
+        '",@pMEME_HICN="',CASE WHEN id_change = 0 THEN new_ID_value ELSE m.mbi END,
+        '",@pMEME_MEDCD_NO="',m.medicaid_num,
+        '",@pSBAD_TYPE_HOME="H',
+        '",@pSBAD_TYPE_MAIL="',CASE WHEN TRIM(s.address2_1) IS NOT NULL AND TRIM(s.address2_1) <> '' THEN 'M' ELSE 'H' END,
+        '",@pMEME_ELIG_DT="',date_format(m.ap_date_effectiveDate , 'MM/dd/yyyy'),
+        '",@pMEME_HEALTH_ID="',CASE WHEN id_change = 1 THEN new_ID_value ELSE m.MemberId END,
+        CASE WHEN TRIM(race_value)<>'' OR TRIM(race_value)  IS NOT NULL THEN CONCAT('",@pMEME_MCTR_RACE_NVL="',race_value) ELSE '' END,
+        CASE WHEN TRIM(eth_value)<>'' OR TRIM(eth_value)  IS NOT NULL THEN CONCAT('",@pMEME_MCTR_ETHN_NVL="',eth_value) ELSE '' END,
+        '",@pMEME_LATE_ENR_IND="', CASE WHEN int(m.LEPAmount) > 0 OR int(m.LEPWaivedAmount) > 0 OR int(m.LEPSubsidyAmount) > 0 OR int(EGPaysLEP) > 0 THEN 'Y' ELSE 'N' END,
+         '"')
+        AS MEME_ConcatResult
+        FROM meme_dfTable m LEFT JOIN sd_cs_final_dfTable s ON s.sbsb_id = m.sbsb_id
+        """)
+        #dfSql_meme.show()
+        show_dataframe_details(dfSql_meme,"dfSql_meme", displayCountFlag, 0, True)
+
+        #######   MECB KeyWord    ################
+
+        memData_df.createOrReplaceTempView("mecb_dfTable")
+        
+        dfSql_mecb = spark.sql("""SELECT 'MECB' as Type,  m.sbsb_id AS SID,
+        CONCAT('@pRECTYPE="MECB",@pMECB_UPDATE_CD="IN',
+        '",@pMECB_INSUR_TYPE="C",@pMECB_INSUR_ORDER="P",@pMECB_EFF_DT="',date_format(m.ap_date_effectiveDate , 'MM/dd/yyyy'),
+        '",@pMCRE_ID="00000",@pMECB_TERM_DT="',date_format(m.term_date , 'MM/dd/yyyy'),
+        CASE WHEN m.term_date  > m.ap_date_effectiveDate and date_format(m.term_date, 'MM/dd/yyyy') <> '12/31/9999'  THEN CONCAT('",@pMECB_MCTR_TRSN="',"EDI") ELSE '' END,
+         '"')
+        AS MECB_ConcatResult 
+        FROM mecb_dfTable  m LEFT JOIN sd_cs_final_dfTable s ON s.sbsb_id = m.sbsb_id
+         where s.changemember=0 AND (TRIM(m.other_insurance) <> '' OR m.secondary_insurance = '1')
+        """)
+        #dfSql_mecb.show()
+        show_dataframe_details(dfSql_mecb,"dfSql_mecb", displayCountFlag, 0, True)
+
+        dfSql_mecb_msp = spark.sql("""SELECT 'MECB' as Type,  m.sbsb_id AS SID,
+        CONCAT('@pRECTYPE="MECB",@pMECB_UPDATE_CD="',CASE WHEN s.changemember =1 THEN 'AP' ELSE 'IN' END,
+        '",@pMECB_INSUR_TYPE="C",@pMECB_INSUR_ORDER="P",@pMECB_EFF_DT="',date_format(a.S_EffDate , 'MM/dd/yyyy'),
+        '",@pMCRE_ID="00000",@pMECB_TERM_DT="',date_format(a.S_TermDate, 'MM/dd/yyyy'),
+        CASE WHEN a.S_TermDate > a.S_EffDate and date_format(a.S_TermDate, 'MM/dd/yyyy') <> '12/31/9999'  THEN CONCAT('",@pMECB_MCTR_TRSN="',mecb_mctr_trsn) ELSE '' END,
+        '"')
+        AS MECB_ConcatResult 
+        FROM mecb_dfTable m LEFT JOIN sd_cs_final_dfTable s ON s.sbsb_id = m.sbsb_id JOIN eam_msp_dfTable a ON m.mbi = a.MBINumber
+        """)
+        show_dataframe_details(dfSql_mecb_msp,"dfSql_mecb_msp", displayCountFlag, 0, True)
+        dfSql_mecb_msp.show()
+        
+        dfSql_mecb = dfSql_mecb.union(dfSql_mecb_msp)
+        
+        #######   MEPR KeyWord    ################
+        if pcp_final is not None:
+            pcp_final = pcp_final.withColumn('PRPR_ID', F.col('prpr_result'))
+            memData_prpr_df = memData_df.join(pcp_final, memData_df.sbsb_id == pcp_final.sbsb_id, "left_outer") \
+                .select(memData_df["*"], pcp_final["PRPR_ID"], pcp_final["error"])
+            #pcp_final.show()
+            show_dataframe_details(pcp_final,"pcp_final", displayCountFlag, 0, True)
+        else:
+            memData_prpr_df =  memData_df.withColumn('PRPR_ID', lit("")) \
+                .withColumn('error', lit(""))
+
+        #memData_prpr_df = memData_df.join(pcp_final, on='sbsb_id', how='left')
+        # if df_facets_prpr.count() > 0:
+        #     default_prprId = df_facets_prpr.collect()[0]["PRPR_ID"]
+        # else:
+        #     default_prprId = "DEFAULT00001"
+        # memData_prpr_df = memData_prpr_df.withColumn("Def_PRPR_ID", lit(default_prprId))
+        memData_prpr_df.createOrReplaceTempView("memData_prpr_dfTable")
+
+        # To-do only for plan changes and new enrollments
+        logger.info("starting the MEPR keyword build")
+
+        dfSql_mepr = spark.sql("""SELECT 
+        'MEPR' as Type,  
+        mp.sbsb_id AS SID,
+        CONCAT('@pRECTYPE="MEPR",@pMEPR_UPDATE_CD="AP",@pMEPR_PCP_TYPE="MP",@pMEPR_EFF_DT="',mp.effectivedate,  
+        '",@pPRPR_ID="',CASE WHEN TRIM(mp.PCPID) IS NOT NULL AND TRIM(mp.PCPID) <> '' THEN mp.PCPID 
+                             WHEN TRIM(mp.PRPR_ID) IS NOT NULL AND TRIM(mp.PRPR_ID) <> '' THEN CAST(mp.PRPR_ID as STRING)
+                             ELSE 
+                                CASE  WHEN TRIM(sd.ProductSuite) = 'PPO' THEN 'DEFAULT00002'
+                                    ELSE 'DEFAULT00003'
+                                END
+                             END,
+        CASE WHEN (mp.error IS NOT NULL AND mp.error <> '') and (TRIM(mp.PCPID) IS NULL OR TRIM(mp.PCPID) = '')   then CONCAT('",@pMEPR_MCTR_ORSN="',mp.error)  ELSE '' END ,                            
+    
+        '"'
+        ) AS MEPR_ConcatResult                                
+        FROM memData_prpr_dfTable mp
+        LEFT JOIN  sd_cs_final_dfTable sd ON sd.sbsb_id = mp.sbsb_id
+        WHERE EXISTS(SELECT 1 FROM change_cond_dfTable c WHERE c.sbsb_id = mp.sbsb_id AND c.EligType IN ('SL', 'RI', 'CH'))                       
+        """)
+
+        logger.info('Built the MEPR keyword build')
+
+        #dfSql_mepr.show()
+        show_dataframe_details(dfSql_mepr,"dfSql_mepr", displayCountFlag, 0, True)
+
+        #mepr_row =dfSql_meme.collect()[0]
+        #B = mepr_row["MEME_ConcatResult"]
+        #print(B)
+    except Exception as err:
+        logger.error(f'Error occured in creating facets Member keywords : {err}')
+        #print(err)
+        logging.info("FCT_EAMFCTMMS: ERROR: Error occured in creating facets keyword")
+
+    ##############   MECD/MCDV Keyword  #############################
+    try:
+        Sub_Span_df = subData_df.join(eam_span_df, subData_df.mbi == eam_span_df.MBINumber, "left_outer") \
+            .select(subData_df["*"],eam_span_df["MBINumber"], eam_span_df["SType"], eam_span_df["Value"], eam_span_df["S_EffDate"], eam_span_df["S_TermDate"],  eam_span_df["LAST_MODIFIED"],  eam_span_df["CREATE_DATE"])
+
+        df_mcaid = Sub_Span_df.filter(col("SType") == "MCAID")
+        #df_mcaid.show()
+        #df_facets_mctr.show()
+        show_dataframe_details(df_mcaid,"df_mcaid", displayCountFlag, 0, True)
+        show_dataframe_details(df_facets_mctr,"df_facets_mctr", displayCountFlag, 0, True)
+        #mctr_join_condition = (df_mcaid["value"] == df_facets_mctr["MCTR_DESC"] )
+        join_mcaid_mctr_df = df_mcaid.join(df_facets_mctr,df_mcaid["value"] == df_facets_mctr["MCTR_DESC"] , "left_outer") \
+            .select(df_mcaid["*"],df_facets_mctr["MCTR_VALUE"])
+        join_mcaid_mctr_df.createOrReplaceTempView("join_mcaid_mctr_dfTable")
+        #join_mcaid_mctr_df.show()
+        show_dataframe_details(join_mcaid_mctr_df,"join_mcaid_mctr_df", displayCountFlag, 0, True)
+        dfSql_mecd_mcdv_A = spark.sql(""" SELECT sbsb_id AS SID,
+            
+            CONCAT('@pRECTYPE="MECD",@pMECD_UPDATE_CD="AP",@pMECD_EFF_DT="', date_format(S_EffDate, 'MM/dd/yyyy'),
+            '",@pMECD_TERM_DT="', date_format(S_TermDate, 'MM/dd/yyyy'),
+            '",@pMECD_AUTO_ASSN_IND="N',
+            '",@pMECD_MCTR_MDCT="000',
+            '",@pMECD_MCTR_MDST="',state,
+            '",@pMECD_MCTR_AIDC="',COALESCE(MCTR_VALUE, Value) ,
+            '",@pMECD_LOC_FUND_IND="N',
+             '"')
+            AS A_MECD_ConcatResult,
+             CONCAT('@pRECTYPE="MEDV",@pMEDV_UPDATE_CD="AP",@pMECD_EFF_DT="', date_format(S_EffDate, 'MM/dd/yyyy'),
+            '",@pMEDV_LAST_VER_DT="',CASE WHEN LAST_MODIFIED >= CREATE_DATE THEN date_format(LAST_MODIFIED, 'MM/dd/yyyy')  ELSE date_format(CREATE_DATE, 'MM/dd/yyyy') END ,
+            '",@pMEDV_LAST_VER_NAME="State 271',
+            '",@pMEDV_MCTR_VMTH="271',
+            '",@pMEDV_MCTR_VRSN="AIDC',
+             '"')
+            AS A_MCDV_ConcatResult
+            FROM join_mcaid_mctr_dfTable
+            """)
+        #dfSql_mecd_mcdv_A.show(truncate=False)
+        show_dataframe_details(dfSql_mecd_mcdv_A,"dfSql_mecd_mcdv_A", displayCountFlag, 0, False)
+        dfSql_mecd_mcdv_A.createOrReplaceTempView("mecd_mcdv_A_dfTable")
+
+        dfSql_mecd_mcdv = spark.sql("""
+         SELECT 'MECD' as Type,
+            SID,
+            concat_ws("\\r\\n", NULLIF(A_MECD_ConcatResult,''), NULLIF(A_MCDV_ConcatResult,'') ) as  MECD_ConcatResult
+            from mecd_mcdv_A_dfTable Group by SID, A_MECD_ConcatResult, A_MCDV_ConcatResult
+        """)
+        show_dataframe_details(dfSql_mecd_mcdv,"dfSql_mecd_mcdv", displayCountFlag, 0, True)
+
+    except Exception as err:
+        print('Error occured in creating facets MECD keywords')
+        print(err)
+        logging.info("FCT_EAMFCTMMS: ERROR: Error occured in creating MECD keyword")
+
+    #     #######   MCRP KeyWord    ################
+
+    # #df_facets_SubMemKeys
+    # #df_facets_mcrp_rel
+    # #memData_df
+    # try:
+    #     join_condition = (memData_df["lastname"] == df_facets_mcrp_rel["MCRP_LAST_NAME"] )& \
+    #                      (memData_df["firstname"] == df_facets_mcrp_rel["MCRP_FIRST_NAME"] )
+    #     join_submem_mcrp_df = memData_df.join(df_facets_mcrp_rel,join_condition, "left_outer")
+    #     #join_submem_mcrp_df.show()
+    #     show_dataframe_details(join_submem_mcrp_df,"join_submem_mcrp_df", displayCountFlag, 0, True)
+    #     join_submem_mcrp_df.createOrReplaceTempView("Joined_MCRPTable")
+
+    #     dfSql_mcrp = spark.sql("""SELECT 'MCRP' as Type,  sbsb_id AS SID,
+    #     split(Resp_Party_Name,' ')[0] as LastName,
+    #     split(Resp_Party_Name,' ')[1]  as FirstName,
+    #     split(Resp_Party_Name,' ')[2]  as MiddleName,
+    #     CONCAT('@pRECTYPE="MCRP",@pMCRP_ID="', COALESCE(MCRP_ID, '*'),
+    #     '",@pMCRP_LAST_NAME="',split(Resp_Party_Name,' ')[0] ,
+    #     '",@pMCRP_FIRST_NAME="',COALESCE(split(Resp_Party_Name,' ')[1], '')  ,
+    #     '",@pMCRP_MID_INIT="',COALESCE(split(Resp_Party_Name,' ')[2], '')  ,
+    #     '",@pPHONE="',CAST(Resp_Party_Phone as STRING),
+    #      '"')
+    #     AS MCRP_ConcatResult
+    #     FROM Joined_MCRPTable where Resp_Party_Name <>''
+    #     """)
+    #     #dfSql_mcrp.show()
+    #     show_dataframe_details(dfSql_mcrp,"dfSql_mcrp", displayCountFlag, 0, True)
+
+    #     #######   MERP KeyWord    ################
+    #     dfSql_merp = spark.sql("""SELECT 'MCRP' as Type,  sbsb_id AS SID,
+    #     CONCAT('@pRECTYPE="MERP",@pMERP_UPDATE_CD="AP",@pMERP_EFF_DT="',effectivedate,
+    #     '",@pMERP_MCTR_TYPE="EXEC',
+    #     '",@pMERP_LAST_VER_DT="',date_format(current_date(), 'MM/dd/yyyy'),
+    #     '",@pMERP_LAST_VER_NAME="OEC',
+    #     '",@pMCRP_ID="',COALESCE(MCRP_ID, '*'),
+    #      '"')
+    #      AS MERP_ConcatResult
+    #     FROM Joined_MCRPTable where Resp_Party_Name <>'' --and MERP_ID IS NULL
+    #     """)
+    #     #dfSql_merp.show()
+    #     show_dataframe_details(dfSql_merp,"dfSql_merp", displayCountFlag, 0, True)
+    # except Exception as err:
+    #     logger.error(f'Error occured in creating facets Relationship keywords : {err}')
+    #     #print(err)
+    #     logging.info("FCT_EAMFCTMMS: ERROR: Error occured in creating facets keywords")
+    try:
+        #######   NMDM KeyWord    ################
+
+        #nmdmData_df.createOrReplaceTempView("nmdm_dfTable")
+        newmem_nmdm_df =nmdmData_df.join(df_new_changeMember,( df_new_changeMember.sbsb_id == nmdmData_df.sbsb_id ) & (df_new_changeMember.changemember ==0), "inner" ) \
+            .select(nmdmData_df["*"])
+        newmem_nmdm_df.createOrReplaceTempView("newmem_nmdm_dftable")
+        final_nmdm_df = spark.sql("""
+           SELECt n.*,
+           CASE WHEN MAX(CASE WHEN e.SType ='HOSP' THEN 1 ELSE 0 END) > 0 THEN 'Y' ELSE 'N' END AS hasHOSP,
+           CASE WHEN MAX(CASE WHEN e.SType ='INST' THEN 1 ELSE 0 END) > 0 THEN 'Y' ELSE 'N' END AS hasINST,
+           CASE WHEN MAX(CASE WHEN e.SType ='NHC' THEN 1 ELSE 0 END) > 0 THEN 'Y' ELSE 'N' END AS hasNHC
+           
+           FROM newmem_nmdm_dftable n 
+           LEFT JOIN eam_span_df_dfTable e ON n.mbi = e.MBINumber
+           Group By n.sbsb_id, 
+           n.alt_sbsb_id,n.mbi,n.planid,n.pbp,n.segment_id,
+           n.ap_date_effectivedate,n.partA_EffDate,n.partB_EffDate,n.partD_EffDate,
+           n.EGHP,n.enrollment_src,n.prior_commercial_override,n.lis_effdate, n.lis_amount,
+           n.election_type,n.medicaid,n.esrd,n.credible_coverage,n.emp_sub_override,
+           n.Premium_Withhold_Option,n.Part_C_Premium,n.Part_D_Premium,n.RXGroup,
+           n.RXID,n.RXBIN,n.RXPCN,n.SecondaryRXGroup,n.SecondaryRXID,
+           n.EAF_Uncovered_Months ,n.LEP_Amount,n.LEP_Waived_Amount,n.LEP_Subsidy_Amount,n.LANGUAGE,               
+           n.Accessibility_Format,n.SCC,n.SCC_MCST,n.SCC_MCCT,n.Copay_Cat
+           """)
+        #final_nmdm_df =final_nmdm_df.join(lics_span_df, final_nmdm_df.mbi == lics_span_df.MBI, "left_outer").select(final_nmdm_df["*"],lics_span_df["LIS_LEVEL"])
+
+        # TDOD  If LIS_level == 0 the skip NMDM Keyword generation
+        # TO-DO BGBG_ID as ContractID,@pNMDM_SIG_DT, Laguage  add, lics effectivedate to dateformat, SCC MCST and MCCT
+        concat_expr = concat_ws("",
+                                lit("@pRECTYPE=\"NMDM\",@pNMDM_HICN=\""), col("mbi"),lit("\""),
+                                lit(",@pNMDM_PBP_ID=\""), col("pbp"),lit("\""),
+                                lit(",@pNMDM_PARTA_DT=\""), col("partA_EffDate"),lit("\""),
+                                lit(",@pNMDM_PARTB_DT=\""), col("partB_EffDate"),lit("\""),
+                                lit(",@pNMDM_PARTD_DT=\""), col("partD_EffDate"),lit("\""),
+                                lit(",@pNMDM_ELECT_TYPE=\""), col("election_type"),lit("\""),
+                                lit(",@pNMDM_PREM_WH_OPT=\""), col("Premium_Withhold_Option"),lit("\""),
+                                when((col("EGHP").isNotNull()) & (length(col("EGHP"))>0),                                           concat_ws("",lit(",@pNMDM_EGHP=\"N"),lit("\""))).otherwise(lit("")),
+                                when((col("enrollment_src").isNotNull()) & (length(col("enrollment_src"))>0),                       concat_ws("",lit(",@pNMDM_ENRL_SOURCE=\""), col("enrollment_src"),lit("\""))).otherwise(lit("")),
+                                when((col("prior_commercial_override").isNotNull()) & (length(col("prior_commercial_override"))>0) & (col("esrd")=="Y") , concat_ws("",lit(",@pNMDM_PRIOR_COM_OVR=\""), col("prior_commercial_override"),lit("\""))).otherwise(lit("")),
+                                when(((col("prior_commercial_override").isNull()) | (trim(col("prior_commercial_override"))=="")) & (col("esrd")=="Y"),    concat_ws("",lit(",@pNMDM_PRIOR_COM_OVR=\""), lit("0"),lit("\""))).otherwise(lit("")),
+                                when((col("SCC").isNotNull()) & (length(col("SCC"))>0),                                             concat_ws("",lit(",@pNMDM_MCTR_MCST=\""), col("SCC_MCST"),lit("\""))).otherwise(lit("")),
+                                when((col("SCC").isNotNull()) & (length(col("SCC"))>0),                                             concat_ws("",lit(",@pNMDM_MCTR_MCCT=\""), col("SCC_MCCT"),lit("\""))).otherwise(lit("")),
+                                when((col("SCC").isNotNull()) & (length(col("SCC"))>0),                                             concat_ws("",lit(",@pNMDM_BGBG_ID=\""), col("planid"),lit("\""))).otherwise(lit("")),
+                                #when((col("LIS_LEVEL").isNotNull()) & (length(col("LIS_LEVEL")) > 0) & (col("LIS_LEVEL") > 0),      concat_ws("",lit(",@pNMDM_PARTD_SBSDY=\""), col("LIS_LEVEL"),lit("\""))).otherwise(lit("")),
+                                #when((col("Copay_Cat").isNotNull()) & (length(col("lis_effdate"))>0),                               concat_ws("",lit(",@pNMDM_COPAY_CAT=\""), col("Copay_Cat"),lit("\""))).otherwise(lit("")),
+                                #when((col("lis_effdate").isNotNull()) & (length(col("lis_effdate"))>0),                             concat_ws("",lit(",@pNMDM_LICS_EFF_DT=\""), col("lis_effdate"),lit("\""))).otherwise(lit("")),
+                                #when((col("lis_amount").isNotNull()) & (length(col("lis_amount"))>0),                               concat_ws("",lit(",@pNMDM_LICS_SBSDY=\""), col("lis_amount"),lit("\""))).otherwise(lit("")),
+                                when((col("ap_date_effectivedate").isNotNull()) & (length(col("ap_date_effectivedate"))>0),         concat_ws("",lit(",@pNMDM_SIG_DT=\""), col("ap_date_effectivedate"),lit("\""))).otherwise(lit("")),
+                                when((col("medicaid").isNotNull()) & (length(col("medicaid"))>0),                                   concat_ws("",lit(",@pNMDM_MDCD=\""), col("medicaid"),lit("\""))).otherwise(lit(",@pNMDM_MDCD=\"N\"")),
+                                when((col("hasHOSP").isNotNull()) & (length(col("hasHOSP"))>0),                                     concat_ws("",lit(",@pNMDM_HSPC=\""), col("hasHOSP"),lit("\""))).otherwise(lit("")),
+                                when((col("hasINST").isNotNull()) & (length(col("hasINST"))>0),                                     concat_ws("",lit(",@pNMDM_INST=\""), col("hasINST"),lit("\""))).otherwise(lit("")),
+                                when((col("esrd").isNotNull()) & (length(col("esrd"))>0),                                           concat_ws("",lit(",@pNMDM_ESRD=\""), col("esrd"),lit("\""))).otherwise(lit("")),
+                                when((col("hasNHC").isNotNull()) & (length(col("hasNHC"))>0),                                       concat_ws("",lit(",@pNMDM_NHC=\""), col("hasNHC"),lit("\""))).otherwise(lit("")),
+                                when((col("credible_coverage").isNotNull()) & (length(col("credible_coverage"))>0),                 concat_ws("",lit(",@pNMDM_CRCO=\""), col("credible_coverage"),lit("\""))).otherwise(lit("")),
+                                when((col("emp_sub_override").isNotNull()) & (length(col("emp_sub_override"))>0),                   concat_ws("",lit(",@pNMDM_ESEO=\""), col("emp_sub_override"),lit("\""))).otherwise(lit("")),
+                                when((col("Part_C_Premium").isNotNull()) & (length(col("Part_C_Premium"))>0),                       concat_ws("",lit(",@pNMDM_PRTC_PREM=\""), col("Part_C_Premium"),lit("\""))).otherwise(lit("")),
+                                when((col("Part_D_Premium").isNotNull()) & (length(col("Part_D_Premium"))>0),                       concat_ws("",lit(",@pNMDM_PRTD_PREM=\""), col("Part_D_Premium"),lit("\""))).otherwise(lit("")),
+                                when((col("RXGroup").isNotNull()) & (length(col("RXGroup"))>0),                                     concat_ws("",lit(",@pNMDM_MCTR_RX_GROUP=\""), col("RXGroup"),lit("\""))).otherwise(lit("")),
+                                when((col("RXID").isNotNull()) & (length(col("RXID"))>0),                                           concat_ws("",lit(",@pNMDM_RX_ID=\""), col("RXID"),lit("\""))).otherwise(lit("")),
+                                when((col("RXBIN").isNotNull()) & (length(col("RXBIN"))>0),                                         concat_ws("",lit(",@pNMDM_MCTR_RXBIN=\""), col("RXBIN"),lit("\""))).otherwise(lit("")),
+                                when((col("RXPCN").isNotNull()) & (length(col("RXPCN"))>0),                                         concat_ws("",lit(",@pNMDM_MCTR_RXPCN=\""), col("RXPCN"),lit("\""))).otherwise(lit("")),
+                                when((col("SecondaryRXGroup").isNotNull()) & (length(col("SecondaryRXGroup"))>0),                   concat_ws("",lit(",@pNMDM_COB_RX_GROUP=\""), col("SecondaryRXGroup"),lit("\""))).otherwise(lit("")),
+                                when((col("SecondaryRXID").isNotNull()) & (length(col("SecondaryRXID"))>0),                         concat_ws("",lit(",@pNMDM_COB_RX_ID=\""), col("SecondaryRXID"),lit("\""))).otherwise(lit("")),
+                                when((col("EAF_Uncovered_Months").isNotNull()) & (length(col("EAF_Uncovered_Months"))>0),           concat_ws("",lit(",@pNMDM_UNCOV_MOS=\""), col("EAF_Uncovered_Months"),lit("\""))).otherwise(lit("")),
+                                when((col("LEP_Amount").isNotNull()) & (length(col("LEP_Amount"))>0),                               concat_ws("",lit(",@pNMDM_LATE_PENALTY=\""), col("LEP_Amount"),lit("\""))).otherwise(lit("")),
+                                when((col("LEP_Waived_Amount").isNotNull()) & (length(col("LEP_Waived_Amount"))>0),                 concat_ws("",lit(",@pNMDM_LATE_WAIV_AMT=\""), col("LEP_Waived_Amount"),lit("\""))).otherwise(lit("")),
+                                when((col("LEP_Subsidy_Amount").isNotNull()) & (length(col("LEP_Subsidy_Amount"))>0),               concat_ws("",lit(",@pNMDM_LATE_SBSDY=\""), col("LEP_Subsidy_Amount"),lit("\""))).otherwise(lit("")),
+                                when((col("LANGUAGE") == "ENG") | (col("LANGUAGE") == "SP"),
+                                     when(col("LANGUAGE") == "SP", (lit(",@pNMDM_PREF_LANG_NVL=\"S\"")))
+                                     .otherwise("")
+                                     ).otherwise(lit(",@pNMDM_PREF_LANG_NVL=\"O\"")),
+                                when((col("Accessibility_Format").isNotNull()) & (length(col("Accessibility_Format"))>0),           concat_ws("",lit(",@pNMDM_ACCESS_FMT_NVL=\""), col("Accessibility_Format"),lit("\""))).otherwise(lit(""))
+                                )
+
+        ####Left Join with SBEL and check if the member os new member########################################
+        dfSql_nmdm = final_nmdm_df.select(col("sbsb_id").alias("SID"), concat_expr.alias("NMDM_ConcatResult"))
+
+        #dfSql_nmdm.show()
+        show_dataframe_details(dfSql_nmdm,"dfSql_nmdm", displayCountFlag, 0, True)
+
+        #############################################
+        #####   MEMD Keyword    #####################
+        #############################################
+
+        #span_memd_df = span_df.join(memd_df, span_df.mbi == memd_df.MBINumber, "left_outer")
+        span_memd_df = memd_df.join( eam_span_df , eam_span_df.MBINumber == memd_df.MBI, "left_outer")
+        #rename to avoid ambigious columns
+        memd_df = memd_df.withColumnRenamed("LIS_Level","LIS_Level_memd")
+        #span type can be parameterized add code in tech debt story
+        list_event = [
+            "CRCO","DABL","DETH","EGHP","ESEO"
+            ,"ESRD","FAOO","HICN","HOSP", "NUNCM"
+            ,"LICS","MDCD","MEDI","MEPI","MIDC"
+            ,"MSP","MTM","NHC","PBP","PCO","MCAID"
+            ,"PDOO","PREM","PRSK","PRTA","PRTB"
+            ,"PRTD","RAFT","RISK","SCC","VBID"
+            ,"WKAG","MECB","LEP", "ESMSP", "DIAL"
+            ,"INST", "EFFD"]
+        span_memd_df = span_memd_df.filter(span_memd_df.SType.isin(list_event))
+        #span_memd_df.show(truncate=False)
+        show_dataframe_details(span_memd_df,"span_memd_df", displayCountFlag, 0, False)
+        #span_memd_chgmem_df = span_memd_df.join(df_new_changeMember,( df_new_changeMember.sbsb_id == span_memd_df.sbsb_id ) & (df_new_changeMember.changemember ==1), "inner" ) \
+        #.select(span_memd_df["*"])
+        span_memd_df =span_memd_df.filter(~((col("SType") == "NUNCM") &  (col("LEPAmount").isNull() | (trim(col("LEPAmount")) == "" ))))
+        span_memd_chgmem_df = span_memd_df
+        ### write where cloause after joining with SBEl Table for change members only######################
+        span_memd_chgmem_df.createOrReplaceTempView("memd_span_table")
+
+        dfSql_Nolics_memd = spark.sql("""
+           SELECT "MEMD" as Type, memd.sbsb_id AS SID, 
+                CONCAT_WS("\\r\\n", COLLECT_LIST(
+                    CONCAT(
+                        '@pRECTYPE="MEMD",@pMEMD_UPDATE_CD="AP',
+                        '",@pMEMD_EVENT_CD="',
+                        CASE WHEN SType = 'HOSP' THEN 'HSPC'
+                             WHEN TRIM(SType) = 'NUNCM' THEN 'LATE'
+                             WHEN TRIM(SType) = 'MCAID' THEN 'MDCD'
+                             --ENCUC-684-Stop MSP Adding MEMD Rows in Facets
+                             --WHEN TRIM(SType) = 'ESMSP' THEN 'MSP'
+                             WHEN TRIM(SType) = 'DIAL' THEN 'RAFT'
+                             WHEN TRIM(SType) = 'SCC' THEN 'SCCC'
+                             WHEN TRIM(SType) = 'EFFD' THEN 'PRTD'
+                            ELSE TRIM(SType) END ,
+                        '",@pMEMD_HCFA_EFF_DT="', date_format(S_EffDate , 'MM/dd/yyyy'),
+                        '",@pMEMD_HCFA_TERM_DT="',date_format(S_TermDate, 'MM/dd/yyyy'),
+                        '",@pMEMD_EVENT_EFF_DT="', date_format(S_EffDate, 'MM/dd/yyyy'),
+                        '",@pMEMD_EVENT_TERM_DT="',date_format(S_TermDate, 'MM/dd/yyyy'),
+                        CASE WHEN TRIM(SType) = 'SCC' THEN CONCAT('",@pMEMD_MCTR_MCST="', SCC_MCST) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'SCC' THEN CONCAT('",@pMEMD_MCTR_MCCT="', SCC_MCCT) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'HICN' THEN CONCAT('",@pMEME_HICN="', MBINumber) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'SCC' THEN CONCAT('",@pBGBG_ID="', planid) ELSE '' END,
+                        --ENCUC-684-Stop MSP Adding MEMD Rows in Facets              
+                        --CASE WHEN TRIM(SType) = 'MSP' THEN CONCAT('",@pMEMD_MSP_CD="', value) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PREM' THEN CONCAT('",@pMEMD_PREM_WH_OPT="', PremiumWithholdoption) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PREM' THEN CONCAT('",@pMEMD_PRTC_PREM="', PartCPremium) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PREM' THEN CONCAT('",@pMEMD_PRTD_PREM="', PartDPremium) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PBP' THEN CONCAT('",@pMEMD_SEGMENT_ID="', SegmentId)  ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PBP' OR TRIM(SType) = 'PRTD' THEN CONCAT('",@pMEMD_ENRL_SOURCE="', EnrollmentSource) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'NUNCM' THEN CONCAT('",@pMEMD_UNCOV_MOS="', Numberofuncoveredmonths) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PRTD' THEN CONCAT('",@pMEMD_RX_ID="', RXID) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PRTD' THEN CONCAT('",@pMEMD_MCTR_RX_GROUP="', RXGroup) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PRTD' THEN CONCAT('",@pMEMD_MCTR_RXBIN="', RXBIN) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PRTD' THEN CONCAT('",@pMEMD_MCTR_RXPCN="', RXPCN) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PRTD' AND TRIM(SecondaryRXID) IS NOT NULL AND TRIM(SecondaryRXID) <> ''  THEN '",@pMEMD_COB_IND="Y' ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PRTD' AND TRIM(SecondaryRXID) IS NOT NULL AND TRIM(SecondaryRXID) <> ''  THEN CONCAT('",@pMEMD_COB_RX_ID="', SecondaryRXID) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PRTD' AND TRIM(SecondaryRXID) IS NOT NULL AND TRIM(SecondaryRXID) <> ''  THEN CONCAT('",@pMEMD_COB_RX_GROUP="', SecondaryRxGroup) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PRTD' AND TRIM(SecondaryRXID) IS NOT NULL AND TRIM(SecondaryRXID) <> ''  THEN CONCAT('",@pMEMD_COB_RXBIN="', SecondaryRXBIN) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PRTD' AND TRIM(SecondaryRXID) IS NOT NULL AND TRIM(SecondaryRXID) <> ''  THEN CONCAT('",@pMEMD_COB_RXPCN="', SecondaryRXPCN) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'LICS' THEN CONCAT('",@pMEMD_PARTD_SBSDY="', value) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'LICS' THEN CONCAT('",@pMEMD_COPAY_CAT="', value) ELSE '' END,
+                
+                        CASE WHEN TRIM(SType) = 'PBP' THEN CONCAT('",@pMEMD_ELECT_TYPE="', ElectionType) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PBP' THEN CONCAT('",@pMEMD_SIG_DT="', ap_date_effectivedate) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'PBP' THEN CONCAT('",@pMEMD_MCTR_PBP="', Value) ELSE '' END,
+                        --CASE WHEN TRIM(Language) ='ENG' AND TRIM(SecondaryRXID) = ''  THEN '",@pMEMD_PREF_LANG_NVL="E' 
+                        --     WHEN TRIM(Language) = 'SPA'  THEN '",@pMEMD_PREF_LANG_NVL="S'
+                        --    ELSE '",@pMEMD_PREF_LANG_NVL="O' END,
+                        --CASE WHEN TRIM(AccessibilityFormat)= 'Braille'  THEN '",@pMEMD_ACCESS_FMT_NVL ="B' 
+                        --     WHEN TRIM(AccessibilityFormat)= 'Large- Print'  THEN '",@pMEMD_ACCESS_FMT_NVL ="L'
+                        --     WHEN TRIM(AccessibilityFormat)= 'Audio CD'   THEN '",@pMEMD_ACCESS_FMT_NVL ="A'
+                        --    ELSE '' END, 
+                        CASE WHEN TRIM(SType) = 'PBP' AND TRIM(SEPReasonCode) <>'' THEN CONCAT('",@pMEMD_MCTR_SRSN_NVL="', SEPReasonCode) ELSE '' END,                    
+                        '"',
+                        CASE WHEN TRIM(SType) = 'NUNCM' THEN CONCAT(',@pMEMD_LATE_PENALTY=', LEPAmount) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'NUNCM' THEN CONCAT(',@pMEMD_LATE_WAIV_AMT=', LEPWaivedAmount) ELSE '' END,
+                        CASE WHEN TRIM(SType) = 'NUNCM' THEN CONCAT(',@pMEMD_LATE_SBSDY=', LEPSubsidyAmount) ELSE '' END
+                    )
+                )) AS MEMD_ConcatResultA
+            FROM memd_span_table memd where TRIM(memd.SType) not in ('MSP', 'ESMSP')
+
+            GROUP BY memd.sbsb_id
+        """)
+        show_dataframe_details(dfSql_Nolics_memd,"dfSql_Nolics_memd", displayCountFlag, 0, True)
+
+
+        lics_span_memd_df = memd_df.join( lics_span_df , lics_span_df.MBI == memd_df.MBI, "INNER")
+
+        #lics_span_memd_chgmem_df = lics_span_memd_df.join(df_new_changeMember,( df_new_changeMember.sbsb_id == lics_span_memd_df.sbsb_id ) & (df_new_changeMember.changemember ==1), "inner" ) \
+        #.select(lics_span_memd_df["*"])
+        lics_span_memd_chgmem_df = lics_span_memd_df
+        ### write where cloause after joining with SBEl Table for change members only######################
+
+        #TODO signature date = ap_date_effectivedatefor PBP
+        lics_span_memd_chgmem_df.createOrReplaceTempView("memd_span_lics_table")
+        dfSql_lics_memd = spark.sql("""
+          SELECT "MEMD" as Type, memdlics.sbsb_id AS SID, 
+                   CONCAT(
+                       '@pRECTYPE="MEMD",@pMEMD_UPDATE_CD="AP",@pMEMD_EVENT_CD="LICS',
+                       '",@pMEMD_HCFA_EFF_DT="', date_format(Start_Dt , 'MM/dd/yyyy'),
+                       '",@pMEMD_HCFA_TERM_DT="',date_format(End_Dt, 'MM/dd/yyyy'),
+                       '",@pMEMD_EVENT_EFF_DT="', date_format(Start_Dt, 'MM/dd/yyyy'),
+                       '",@pMEMD_EVENT_TERM_DT="',date_format(End_Dt, 'MM/dd/yyyy'),
+                       --CASE WHEN TRIM(Segment_Id) <> '' THEN CONCAT('",@pMEMD_SEGMENT_ID="', Segment_Id)  ELSE '' END,
+                       --CASE WHEN TRIM(EnrollmentSource) <> '' THEN CONCAT('",@pMEMD_ENRL_SOURCE="', EnrollmentSource) ELSE '' END,
+                       --'",@pMEMD_SIG_DT="', ap_date_effectivedate,
+                       CASE  WHEN TRIM(LIS_LEVEL) = '' THEN '' 
+                             WHEN LIS_LEVEL = '0' THEN '' 
+                             ELSE CONCAT('",@pMEMD_PARTD_SBSDY="', LIS_LEVEL) END,
+                       '",@pMEMD_COPAY_CAT="', SUBSTRING(Copay_Category,1,1) ,
+                       --CASE WHEN TRIM(Language) ='ENG'   THEN '",@pMEMD_PREF_LANG_NVL="E' 
+                       --     WHEN TRIM(Language) = 'SPA'  THEN '",@pMEMD_PREF_LANG_NVL="S'
+                       --    ELSE '",@pMEMD_PREF_LANG_NVL="O' END,
+                       --CASE WHEN TRIM(AccessibilityFormat)= 'Braille' THEN '",@pMEMD_ACCESS_FMT_NVL ="B' 
+                       --     WHEN TRIM(AccessibilityFormat)= 'Large- Print' THEN '",@pMEMD_ACCESS_FMT_NVL ="L'
+                       --     WHEN TRIM(AccessibilityFormat)= 'Audio CD'   THEN '",@pMEMD_ACCESS_FMT_NVL ="A'
+                       --     ELSE '' END, 
+                        '"',
+                        CASE WHEN Subsidy_Amt is not NULL or Subsidy_Amt <>'' or Subsidy_Amt > 0 THEN CONCAT(',@pMEMD_LICS_SBSDY=', Subsidy_Amt) ELSE ',@pMEMD_LICS_SBSDY=0.00' END
+                   )
+            AS MEMD_ConcatResultA
+           FROM memd_span_lics_table memdlics
+           GROUP BY memdlics.sbsb_id,memdlics.Start_Dt,memdlics.End_Dt, memdlics.Segment_Id, memdlics.EnrollmentSource,
+           memdlics.Subsidy_Amt,  memdlics.Language, memdlics.AccessibilityFormat, memdlics.ap_date_effectivedate,
+           memdlics.Copay_Category,memdlics.LIS_LEVEL
+          """)
+        show_dataframe_details(dfSql_lics_memd,"dfSql_lics_memd", displayCountFlag, 0, False)
+
+        #---------- MEMD for PREM Events -----------------#
+        prem_memd_df = memd_df.join( prem_df , prem_df.MBINumber == memd_df.MBI, "INNER") \
+                              .select(memd_df["sbsb_id"],prem_df["P_EffDate"],prem_df["PWOption"],prem_df["PartCPrem"],prem_df["PartDPrem"]) \
+                              .orderBy(col("sbsb_id"),col("P_EffDate"))
+        prem_memd_df.createOrReplaceTempView("prem_memd_table")
+        dfSql_prem_memd = spark.sql("""
+            SELECT "MEMD" as Type, pm.sbsb_id AS SID, 
+                   CONCAT(
+                       '@pRECTYPE="MEMD",@pMEMD_UPDATE_CD="AP",@pMEMD_EVENT_CD="PREM',
+                       '",@pMEMD_HCFA_EFF_DT="', date_format(P_EffDate , 'MM/dd/yyyy'),
+                       '",@pMEMD_EVENT_EFF_DT="', date_format(P_EffDate, 'MM/dd/yyyy'),
+                       '",@pMEMD_PREM_WH_OPT="', PWOption,
+                       CASE WHEN PartCPrem is not NULL or PartCPrem <>'' THEN CONCAT('",@pMEMD_PRTC_PREM=', PartCPrem) ELSE  '",@pMEMD_PRTC_PREM=0.00' END ,
+                       CASE WHEN PartCPrem is not NULL or PartCPrem <>'' THEN CONCAT(',@pMEMD_PRTD_PREM=', PartDPrem) ELSE ',@pMEMD_PRTD_PREM=0.00' END
+                   )
+                AS MEMD_ConcatResultA
+               FROM prem_memd_table pm
+        """)
+        show_dataframe_details(dfSql_prem_memd,"dfSql_prem_memd", displayCountFlag, 0, False)
+
+         #-------Facets  no match PBP---------------
+        pbpnoMatch_df = df_facets_pbp.join(pbp_sbsc_df, (pbp_sbsc_df.sbsb_id == df_facets_pbp.Subscriber_id) & (pbp_sbsc_df.effdate == df_facets_pbp.MEMD_HCFA_EFF_DT) , "LEFT") \
+                                     .select(df_facets_pbp["*"],pbp_sbsc_df["sbsb_id"],pbp_sbsc_df["effdate"])
+        Match_df = pbpnoMatch_df.join(span_memd_df, (span_memd_df.sbsb_id == pbpnoMatch_df.Subscriber_id) , "INNER") \
+                                     .select(pbpnoMatch_df["*"]).distinct()                                     
+        show_dataframe_details(pbpnoMatch_df,"pbpnoMatch_df", displayCountFlag, 0, True)
+        show_dataframe_details(Match_df,"Match_df", displayCountFlag, 0, True)
+        Match_df.createOrReplaceTempView("pbpNoMatch_table")            
+        dfSql_pbpNoMatch_memd = spark.sql("""
+            SELECT "MEMD" as Type, pn.Subscriber_id AS SID, 
+                   CONCAT(
+                       '@pRECTYPE="MEMD",@pMEMD_UPDATE_CD="UP",@pMEMD_EVENT_CD="PBP',
+                       '",@pMEMD_HCFA_EFF_DT="', date_format(MEMD_HCFA_EFF_DT , 'MM/dd/yyyy'),
+                       '",@pMEMD_HCFA_TERM_DT="', date_format(MEMD_HCFA_EFF_DT, 'MM/dd/yyyy'),
+                       '",@pMEMD_EVENT_TERM_DT="', date_format(MEMD_HCFA_EFF_DT, 'MM/dd/yyyy'), 
+                       '"'
+                   )
+                AS MEMD_ConcatResultA
+               FROM pbpNoMatch_table pn
+        """)
+        show_dataframe_details(dfSql_pbpNoMatch_memd,"dfSql_pbpNoMatch_memd", displayCountFlag, 0, False)
+
+        #------------Union all MEMD Data Frames --------------#
+        memd_union_df = dfSql_Nolics_memd.union(dfSql_lics_memd)
+        memd_union_df = memd_union_df.union(dfSql_prem_memd)
+        memd_union_df = memd_union_df.union(dfSql_pbpNoMatch_memd)
+        show_dataframe_details(memd_union_df,"memd_union_df", displayCountFlag, 0, False)
+
+        memd_union_df.createOrReplaceTempView("memd_join_table")
+        dfSql_memd = spark.sql("""
+          SELECT  SID,
+          CONCAT_WS("\\r\\n",COLLECT_LIST(MEMD_ConcatResultA)) AS MEMD_ConcatResult          
+          FROM memd_join_table  
+          Group By SID
+         """)
+        dfSql_memd =dfSql_memd.withColumn('MEMD_ConcatResult', regexp_replace(col('MEMD_ConcatResult'), '\r\n$', ''))
+        show_dataframe_details(dfSql_memd,"dfSql_memd", displayCountFlag, 0, True)
+
+        #row =dfSql_nmdm.collect()[0]
+        #A = row["NMDM_ConcatResult"]
+        #print(A)
+    except Exception as err:
+        logger.error(f'Error occured in creating facets NMDM/MEMD keywords : {err}')
+        #print(err)
+        logging.info("FCT_EAMFCTMMS: ERROR: Error occured in creating NMDM keywords")
+
+
+    dfSql_sbsb = dfSql_sbsb.withColumn("weight", F.lit(0)).withColumn("text_data", col('SBSB_ConcatResult')).withColumn("effective_date", F.lit(''))
+    dfSql_sbwm = dfSql_sbwm.withColumn("weight", F.lit(1)).withColumn("text_data", col('SBWM_ConcatResult')).withColumn("effective_date", F.lit(''))
+    dfSql_sbad = dfSql_sbad.withColumn("weight", F.lit(2)).withColumn("text_data", col('SBAD_ConcatResult')).withColumn("effective_date", F.lit(''))
+    dfSql_sbsg = dfSql_sbsg.withColumn("weight", F.lit(3)).withColumn("text_data", col('SBSG_ConcatResult')).withColumn("effective_date", col('S_EffDate'))
+    dfSql_sbcs = dfSql_sbcs.withColumn("weight", F.lit(4)).withColumn("text_data", col('SBCS_ConcatResult')).withColumn("effective_date", col('S_EffDate'))
+    dfSql_sbel = dfSql_sbel.withColumn("weight", F.lit(5)).withColumn("text_data", col('SBEL_ConcatResult')).withColumn("effective_date", F.lit(''))
+    dfSql_sbsr = dfSql_sbsr.withColumn("weight", F.lit(6)).withColumn("text_data", col('SBSR_ConcatResult')).withColumn("effective_date", F.lit(''))
+    dfSql_sbrt = dfSql_sbrt.withColumn("weight", F.lit(7)).withColumn("text_data", col('SBRT_ConcatResult')).withColumn("effective_date", F.lit(''))
+    dfSql_blei = dfSql_blei.withColumn("weight", F.lit(8)).withColumn("text_data", col('BLEI_ConcatResult')).withColumn("effective_date", F.lit(''))
+    dfSql_meme = dfSql_meme.withColumn("weight", F.lit(9)).withColumn("text_data", col('MEME_ConcatResult')).withColumn("effective_date", F.lit(''))
+    dfSql_mecd_mcdv = dfSql_mecd_mcdv.withColumn("weight", F.lit(10)).withColumn("text_data", col('MECD_ConcatResult')).withColumn("effective_date", F.lit(''))
+    dfSql_mecb = dfSql_mecb.withColumn("weight", F.lit(11)).withColumn("text_data", col('MECB_ConcatResult')).withColumn("effective_date", F.lit(''))
+    dfSql_nmdm = dfSql_nmdm.withColumn("weight", F.lit(12)).withColumn("text_data", col('NMDM_ConcatResult')).withColumn("effective_date", F.lit(''))
+    dfSql_memd = dfSql_memd.withColumn("weight", F.lit(13)).withColumn("text_data", col('MEMD_ConcatResult')).withColumn("effective_date", F.lit(''))
+    dfSql_mepr = dfSql_mepr.withColumn("weight", F.lit(14)).withColumn("text_data", col('MEPR_ConcatResult')).withColumn("effective_date", F.lit(''))
+
+    column = ['SID', 'text_data', 'weight','effective_date']
+    union_df_all = dfSql_sbsb.select(column).union(dfSql_sbad.select(column)).union(dfSql_sbel.select(column)) \
+        .union(dfSql_sbcs.select(column)).union(dfSql_sbsr.select(column)).union(dfSql_sbrt.select(column)) \
+        .union(dfSql_sbsg.select(column)).union(dfSql_blei.select(column)).union(dfSql_sbwm.select(column)) \
+        .union(dfSql_nmdm.select(column)).union(dfSql_meme.select(column)).union(dfSql_mecb.select(column)) \
+        .union(dfSql_mepr.select(column)).union(dfSql_memd.select(column)).union(dfSql_mecd_mcdv.select(column))
+
+    #filterout all record with emtpy tex_data
+    union_df = union_df_all.filter(trim(col('text_data'))!="")
+
+    #filter skipped records
+    #NewMemberNoPBP_df.show()
+    union_df = union_df.join(NewMemberNoPBP_df, union_df["SID"] == NewMemberNoPBP_df["sbsb_id"], "left_anti")
+
+
+    union_df = union_df.orderBy(F.col("SID"), F.col('weight').asc(),F.col('effective_date').asc())
+    #union_df.show()
+    output_df = union_df.select("text_data")
+
+    # mepr_keyword.createOrReplaceTempView("MEPR_OutputTable")
+
+
+    #######   Create OutPut DataFrame    ################
+
+    logger.info("Input")
+    input_check = subData_df.select("sbsb_id")
+    show_dataframe_details(input_check,"Input", displayCountFlag, input_check.count(), False)
+
+    output_check = dfSql_sbsb.selectExpr('SID as sbsb_id')
+    show_dataframe_details(output_check,"Output", displayCountFlag, output_check.count(), False)
+
+    skipped = input_check.subtract(output_check)
+    show_dataframe_details(output_check,"skipped", False, skipped.count(), False)
+    #######   Write to S3 Bucket ################
+    s3 = boto3.client('s3')
+    new_file_name = None
+    if output_df.take(1):
+
+        union_df = union_df.withColumn("text_data", F.concat(F.col("text_data"),F.lit("\r\n")))
+        con_str = union_df.agg(F.collect_list("text_data")).first()[0]
+        final_str = "".join(con_str)
+
+        final_str_strip = final_str.rstrip("\r\n")
+
+        new_file_name = f'Enrollment_EAM_{dt.datetime.now().strftime("%Y%m%d%H%M%S")}_{random.randrange(1, 10**5):05}.kwd'
+        logger.info(new_file_name)
+
+        op_file_key = 'input/' + new_file_name
+
+        s3.put_object(Body=final_str_strip, Bucket=_fct_eam_keyword_s3_bucket_name, Key=op_file_key)
+        #print(f"{_fct_eam_keyword_s3_bucket}/{op_file_key}")
+
+        logger.info(f"Input file: {file_path}/{file_key} generated keyword file:{_fct_eam_keyword_s3_bucket_name}/{op_file_key}")
+    else:
+        logger.info(f"Input file: {file_path}/{file_key} did not generate keyword file")
+
+    new_key = file_key.replace('input/Member/','processed/')
+    s3.copy_object(Bucket=_fct_eam_request_s3_bucket,CopySource={'Bucket':_fct_eam_request_s3_bucket,'Key':file_key},Key=new_key)
+    logger.info(f"Moved to bucket: {_fct_eam_request_s3_bucket}, filepath: {new_key}")
+
+    s3.delete_object(Bucket=_fct_eam_request_s3_bucket,Key=file_key)
+    logger.info(f"Delete from bucket:{_fct_eam_request_s3_bucket}, filepath: {file_key}")
+
+    return  new_file_name
+
+######################################################## Processing Code ##########################################
+
+folder = "input/Member/"
+fileList_S3_df =  s3.list_objects_v2(Bucket=_fct_eam_request_s3_bucket, Prefix=folder)
+fileCount = fileList_S3_df['KeyCount']
+logger.info("Number of files in the folder:"+str(fileCount))
+files =[(obj['Key'], obj['LastModified']) for obj in fileList_S3_df.get('Contents',[]) if 'Legacy_Mem' in obj['Key'] and obj['Key'].endswith('.txt')]
+sorted_files = sorted(files, key=lambda x:x[1])
+
+#Call below common code if there  exist file to process
+if fileCount-1 > 0:
+
+    #=======================================================================
+    #######GET Product Catalog################
+    #=======================================================================
+    bearer_token = make_api_call(_pc_secret_name)
+    df_excel_pc =   getProductCatalog(bearer_token)
+    #list_pbp = [1,24,28]
+    #df_excel_pc = df_excel_pc.filter(df_excel_pc.PBP.isin(list_pbp))
+    #df_excel_pc = df_excel_pc.filter(df_excel_pc.PBP.isin(list_pbp) & col("Group ID").isNotNull()  & (trim(col("Group ID")) !="") & (trim(col("Group ID")) !="None") )
+    if df_excel_pc is not None:
+        #print('ProductCatealog Table')
+        #df_excel_pc.show()
+        show_dataframe_details(df_excel_pc,"ProductCatealog Table", displayCountFlag, 0, True)
+    else:
+        logger.info("Failed to fetch excel data and convert to df")
+
+    df_excel_pc.createOrReplaceTempView("PC_dfTable")
+
+    ##############  EAM Connection #######################
+    #%connections gbs-dev2-provider-postgresSQL-connectio
+    try:
+        #boto3_session = boto3.session.Session()
+        secrets_client = boto3_session.client(
+            service_name='secretsmanager',
+            region_name='us-east-1'
+        )
+        eam_secret = json.loads(secrets_client.get_secret_value(
+            SecretId = _eam_secrets_name
+        )['SecretString'])
+        #------------ SPAN Query -----------------------------
+        eam_query ="""
+        SELECT
+             PLANID,
+             HIC AS SpanMBINumber,
+             SPANTYPE as SpanType,
+             [VALUE] as SpanValue,
+             CAST(STARTDATE AS DATE)AS Span_EffDate,
+             CAST(ENDDATE AS DATE ) AS Span_TermDate,
+             CAST(LastModifiedDate AS DATE ) AS LAST_MODIFIED,
+             CAST(DateCreated AS DATE ) AS CREATE_DATE,
+             '' AS SegmentID
+         FROM [EAM].[dbo].[tbENRLSpans] WHERE
+            SpanType in ( 'CRCO','DABL','DETH','EGHP','ESEO'
+            ,'ESRD','FAOO','HICN','HOSP','EGWP' 
+            ,'LICS','MDCD','MEDI','MEPI','MIDC'
+            ,'MSP','MTM','NHC','PCO','MCAID'
+            ,'PDOO','PREM','PRSK','PRTA','PRTB'
+            ,'PRTD','RAFT','RISK','SCC','VBID'
+            ,'WKAG','MECB','LEP', 'ESMSP', 'DIAL', 'INST', 'KDTSP', 'EFFD')
+            --and HIC in ( '8AP5TC7DV95') 
+            and  LastModifiedDate > GETDATE() -100  
+         Group by PLANID, HIC, SPANTYPE, [Value], STARTDATE, ENDDATE,LastModifiedDate, DateCreated
+         UNION
+    
+         SELECT DISTINCT
+           tbe.PlanID,
+           tbe.HIC AS SpanMBINumber,
+           tbe.SPANTYPE as SpanType,
+           tbe.[Value] as SpanValue,
+           CAST(tbe.STARTDATE AS DATE)AS Span_EffDate,
+           CAST(tbe.ENDDATE AS DATE ) AS Span_TermDate,
+           CAST(tbe.LastModifiedDate AS DATE ) AS LAST_MODIFIED,
+           CAST(tbe.DateCreated AS DATE ) AS CREATE_DATE,
+           CASE
+             WHEN LEN(TRIM(tbt.SegmentID)) > 0 THEN tbt.SegmentID
+             ELSE '000'
+           END AS SegmentID
+         FROM
+          tbENRLSpans tbe
+          LEFT OUTER JOIN tbTransactions tbt on tbt.HIC = tbe.HIC
+          AND tbt.PlanID = tbe.PlanID
+          AND tbt.PBPID = tbe.[Value]
+          AND tbt.ReplyCodes in('011','140','701','702','704','705','706','707','100')
+          AND (tbe.StartDate <= tbt.EffectiveDate and tbe.EndDate >= tbt.EffectiveDate)
+         Where tbe.SpanType = 'PBP' AND tbe.STARTDATE >= DATEFROMPARTS(YEAR(GETDATE()) -1, 1,1)
+         --AND tbe.HIC in ( '8AP5TC7DV95')
+
+         UNION
+
+         SELECT  PLANID,
+             HIC AS SpanMBINumber,
+             SPANTYPE as SpanType,
+             max([VALUE]) as SpanValue,
+             max(CAST(STARTDATE AS DATE))AS Span_EffDate,
+             max(CAST(ENDDATE AS DATE )) AS Span_TermDate,
+             max(CAST(LastModifiedDate AS DATE )) AS LAST_MODIFIED,
+             max(CAST(DateCreated AS DATE )) AS CREATE_DATE,
+             '' AS SegmentID
+         FROM [EAM].[dbo].[tbENRLSpans] WHERE
+            SpanType = 'NUNCM' 
+            and  LastModifiedDate > GETDATE() -100
+            --and HIC IN ('8AP5TC7DV95')
+         Group by PLANID, HIC, SPANTYPE
+        """
+
+        eam_span_dfA = (
+            glueContext.spark_session.read.format("jdbc")
+                .option("url", "jdbc:sqlserver://"+_eam_cloud_jdbc_url)
+                .option("user", eam_secret['username'])
+                .option("password", eam_secret['password'])
+                .option("query", eam_query)
+                .load()
+        )
+        #eam_span_df.show()
+        show_dataframe_details(eam_span_dfA,"eam_span_df", displayCountFlag, 0, True)
+
+        #------------ LICS EAM Query -----------------------------
+        lics_eam_query= """
+        SELECT
+        enMEM.HIC as MBI,
+        memLIS.PartDSubsLevel as LIS_LEVEL
+        ,CAST(lisCopay.Category AS VARCHAR) +'-'++ lisCopay.Description AS Copay_Category
+        ,memLIS.LowIncomePartDPremiumSubsidyAmount AS Subsidy_Amt
+        ,lisCopay.CoPay as Copay_Amt
+        ,cast(memLIS.LowIncomeCoPayEffectiveDate as date) as Start_Dt
+        ,cast(memLIS.LowIncomeCoPayEndDate as date) as End_Dt
+        ,memLIS.LISType as LIS_Type
+        ,memLIS.ChangeSource as Source
+        ,CASE WHEN memLIS.Valid = 1 THEN 'Y' WHEN memLIS.Valid = 0 THEN 'N' ELSE '' END AS VALID_FLAG
+        ,CASE WHEN memLIS.[CURRENT] = 1 THEN 'Y' WHEN memLIS.[CURRENT] = 0 THEN 'N' ELSE '' END AS CURRENT_FLAG
+        ,cast(memLIS.mExport_Legacy as date) AS LEGACY_DATE
+        ,cast(memLIS.DateModified as date) AS MODIFIED_DATE
+        FROM
+        [EAM].[dbo].tbMemberInfoLISLog memLIS
+        INNER JOIN [EAM].[dbo].tbEENRLMembers enMEM ON memLIS.MemCodNum = enMEM.MemCodNum
+        INNER JOIN [EAM].[dbo].tbLISCoPays lisCopay on memLIS.LowIncCoPayCat = lisCopay.Category
+        WHERE
+        lisCopay.Year BETWEEN YEAR(memLIS.LowIncomeCoPayEffectiveDate) AND YEAR(memLIS.LowIncomeCoPayEndDate )
+        AND ((memLIS.DateEntered > GETDATE() - 365) OR (memLIS.DateModified > GETDATE() - 365 ) OR (memLIS.ProcessedDate > GETDATE() - 365 ) )
+        AND memLIS.Valid=1 and memLIS.ChangeSource <> 'BEQ'
+        --AND enMEM.HIC in ( '1RM6QV4KJ20','1U14UV4EX14') 
+        """
+        lics_span_df = (
+            glueContext.spark_session.read.format("jdbc")
+                .option("url", "jdbc:sqlserver://"+_eam_cloud_jdbc_url)
+                .option("user", eam_secret['username'])
+                .option("password", eam_secret['password'])
+                .option("query", lics_eam_query)
+                .load()
+        )
+        #lics_span_df.show()
+        show_dataframe_details(lics_span_df,"lics_span_df", displayCountFlag, 0, True)
+
+        #------------ Ethnicity EAM Query -----------------------------
+        eth_query ="""
+                Select tbt.HIC as MBINumber,
+                       MemberId AS mem_id,
+                       max(EthnicityId) AS ETHNICITY
+               from MemberTransactions mt,
+                  tbTransactions tbt 
+                join TransactionManagerEthnicity tme on tbt.TransID = tme.TransID
+                Where mt.MemCodNum = tbt.MemCodNum  AND EthnicityId IS NOT NULL
+                Group By MemberId,tbt.HIC
+                """
+        eth_df = (
+            glueContext.spark_session.read.format("jdbc")
+                .option("url", "jdbc:sqlserver://"+_eam_cloud_jdbc_url)
+                .option("user", eam_secret['username'])
+                .option("password", eam_secret['password'])
+                .option("query", eth_query)
+                .load()
+        )
+
+        #------------ Race EAM Query -----------------------------
+        race_query ="""
+                Select tbt.HIC as MBINumber,
+                  MemberId AS mem_id,
+                  max(RaceId) as eamRACE
+                From MemberTransactions mt,
+                  tbTransactions tbt 
+                  left outer join TransactionManagerRace tmr on tbt.TransID = tmr.TransID
+                Where mt.MemCodNum = tbt.MemCodNum and  RaceId is not null 
+                Group By MemberId,tbt.HIC
+                """
+        race_df = (
+            glueContext.spark_session.read.format("jdbc")
+                .option("url", "jdbc:sqlserver://"+_eam_cloud_jdbc_url)
+                .option("user", eam_secret['username'])
+                .option("password", eam_secret['password'])
+                .option("query", race_query)
+                .load()
+        )
+
+
+        race_mapping = {272: 'W', 226: 'B', 17: 'I', 202: 'A', 207: 'A', 209: 'A', 212: 'A', 213: 'A', 220: 'A', 201: 'A', 247: 'O', 248: 'O', 265: 'O', 271: 'O', 273: 'O', 274: ''}
+        ethnicity_mapping = {347: '1000', 342: '1001', 303: '1001', 314: '1001', 343: '1001', 345: '1002', 346: ''}
+
+
+        def fetch_race_ethnicity_value(value, mapping_dict):
+            return mapping_dict.get(value, value)
+
+        map_race_udf = F.udf(lambda x: fetch_race_ethnicity_value(x, race_mapping))
+        race_df = race_df.withColumn('race_value',map_race_udf(F.col('eamRace')))
+        show_dataframe_details(race_df,"race_df", displayCountFlag, 0, True)
+
+
+        map_eth_udf = F.udf(lambda x: fetch_race_ethnicity_value(x, ethnicity_mapping ))
+        eth_df = eth_df.withColumn('eth_value',map_eth_udf(F.col('ETHNICITY')))
+        show_dataframe_details(eth_df,"eth_df", displayCountFlag, 0, True)
+
+
+        egwp_rematch_dfA = eam_span_dfA.filter(F.col('SpanType') == 'EGWP')
+        show_dataframe_details(egwp_rematch_dfA,"egwp_rematch_dfA", displayCountFlag, 0, True)
+        egwp_rematch_df =egwp_rematch_dfA.select(F.col('PLANID').alias('eg_PLANID'),
+                                                 F.col('SpanMBINumber').alias('eg_SpanMBINumber'),
+                                                 F.col('SpanType').alias('eg_SpanType'),
+                                                 F.col('SpanValue').alias('eg_SpanValue'),
+                                                 F.col('Span_EffDate').alias('eg_Span_EffDate'),
+                                                 F.col('Span_TermDate').alias('eg_Span_TermDate'),
+                                                 F.col('LAST_MODIFIED').alias('eg_LAST_MODIFIED'),
+                                                 F.col('CREATE_DATE').alias('eg_CREATE_DATE'),
+                                                 F.col('SegmentID').alias('eg_SegmentID'))
+        show_dataframe_details(egwp_rematch_df,"egwp_rematch_df", displayCountFlag, 0, True)
+
+        eam_span_dfA = eam_span_dfA.join(egwp_rematch_df,(eam_span_dfA.SpanType == 'PBP') & (eam_span_dfA.Span_EffDate == egwp_rematch_df.eg_Span_EffDate) & (eam_span_dfA.SpanMBINumber == egwp_rematch_df.eg_SpanMBINumber) , "left_outer") \
+            .select(eam_span_dfA["*"], egwp_rematch_df["eg_SpanValue"])
+
+        show_dataframe_details(eam_span_dfA,"eam_span_dfA", displayCountFlag, 0, True)
+
+        filtered_egwp_df = eam_span_dfA.filter((F.col('SpanType') == 'PBP') & (F.col("SpanValue").startswith("8")))
+        show_dataframe_details(filtered_egwp_df,"filtered_egwp_df", displayCountFlag, 0, True)
+
+        eam_span_df =eam_span_dfA.select(F.col('PLANID'),F.col('SpanMBINumber').alias('MBINumber'),
+                                         F.col('SpanType').alias('SType'),F.col('SpanValue').alias('Value'),
+                                         F.col('Span_EffDate').alias('S_EffDate'),F.col('Span_TermDate').alias('S_TermDate'),
+                                         F.col('LAST_MODIFIED').alias('LAST_MODIFIED'),F.col('CREATE_DATE').alias('CREATE_DATE'),
+                                         F.col('SegmentID'),
+                                         F.col('eg_SpanValue').alias('egwpNum'))
+
+
+        show_dataframe_details(eam_span_df,"eam_span_df", displayCountFlag, 0, True)
+        eam_span_df.createOrReplaceTempView("eam_span_df_dfTable")
+
+        #MSP data frame
+        eam_span_msp_df = eam_span_df.filter(F.col('SType')== 'MSP')
+        eam_span_msp_df = eam_span_msp_df.withColumn('mecb_mctr_trsn', F.lit('EDI'))
+        eam_span_msp_df.createOrReplaceTempView("eam_msp_dfTable")
+        show_dataframe_details(eam_span_msp_df,"eam_span_msp_df", displayCountFlag, 0, True)
+
+
+        max_eam_span_df = spark.sql("""
+            select MBINumber, MAX(S_TermDate) AS maxpbptermdate from  eam_span_df_dfTable WHERE TRIM(SType) ='PBP' group by  MBINumber
+            """)
+
+        min_eam_span_df = spark.sql("""
+            select MBINumber, MIN(S_EffDate) AS minpbpeffdate from  eam_span_df_dfTable WHERE TRIM(SType) ='PBP' group by  MBINumber
+            """)
+        #max_eam_span_df.show()
+        show_dataframe_details(max_eam_span_df,"max_eam_span_df", displayCountFlag, 0, True)
+        #min_eam_span_df.show()
+        show_dataframe_details(min_eam_span_df,"min_eam_span_df", displayCountFlag, 0, True)
+        min_eam_span_df.createOrReplaceTempView("minPBPEff_dfTable")
+        max_eam_span_df.createOrReplaceTempView("maxPBPTerm_dfTable")
+        pbp_eam_span_df= spark.sql("""
+                SELECT   eam.*,
+                pc.`Class Plan ID` as P_CSPI_ID, pc.`Class ID` as P_CSCS_ID, PC.`Product ID` as P_productID, pc.`Group ID` as P_GRGR_ID, pc.`Subgroup ID` as P_SGSG_ID
+                FROM eam_span_df_dfTable eam LEFT JOIN pc_dfTable pc ON eam.planid = pc.`Contract ID` AND CAST(eam.value as int) = CAST(pc.pbp as int) 
+                     AND (eam.S_EffDate  BETWEEN  pc.`effective date` AND pc.`termination date`)
+                     AND ((TRIM(pc.`EGWP`) ='Y' AND  eam.egwpNum =pc.`EAM Group Name`) OR (TRIM(pc.`EGWP`) ='N')) 
+                     AND TRIM(eam.SegmentId) = pc.Segment
+                     WHERE TRIM(eam.SType) = 'PBP'
+            """)
+        #pbp_eam_span_df.show()
+        show_dataframe_details(pbp_eam_span_df,"pbp_eam_span_df", displayCountFlag, 0, True)
+
+        #------------- PREM Records Span Query ------------#
+        prem_query = """
+         SELECT DISTINCT tbt.HIC AS MBINumber,
+          tbt.TransCode,
+          tbt.ReplyCodes,
+          tbp.PWOption,
+          tbt.PartC AS PartCPrem,
+          tbt.partD AS PartDPrem,
+          tbt.EffectiveDate AS P_EffDate
+         FROM tbTransactions tbt
+          JOIN tbPremiumWitholdOptions tbp ON tbp.PWOID = tbt.PremPart
+         WHERE (tbt.TransCode in ('01','61','75') OR tbt.ReplyCodes IN ('122','123','144','170','173','179','191','213','262','267'))
+           AND tbt.ReplyCodes IS NOT NULL AND tbt.ReplyCodes <> '' 
+           AND tbp.PWOption not in ('N') AND tbp.PWOption IS NOT NULL
+           --AND tbt.HIC in ( '8AP5TC7DV95')
+         """
+        prem_df = (
+               glueContext.spark_session.read.format("jdbc")
+               .option("url", "jdbc:sqlserver://"+_eam_cloud_jdbc_url)
+               .option("user", eam_secret['username'])
+               .option("password", eam_secret['password'])
+               .option("query", prem_query)
+               .load()
+            )
+        show_dataframe_details(prem_df,"prem_df", displayCountFlag, 0, True)
+    except Exception as err:
+        #print(err)
+        logger.error(f'FCT_EAMFCTMMS: ERROR: Unable to connect to database instance : {err}')
+
+    ##############  Facets Connection #######################
+    #%connections gbs-dev2-provider-postgresSQL-connection
+    try:
+        #sc = SparkContext.getOrCreate()
+        #glueContext = GlueContext(sc)
+        facets_secret_name = f"arn:aws:secretsmanager:{_facets_region}:{_facetssecrets_account_ID}:secret:{_facets_secrets_name}"
+        #boto3_session = boto3.session.Session()
+        secrets_client = boto3_session.client(
+            service_name='secretsmanager',
+            region_name='us-east-1'
+        )
+        facets_secret = json.loads(secrets_client.get_secret_value(
+            SecretId=facets_secret_name
+        )['SecretString'])
+
+        fac_jdbc_url = f"jdbc:sqlserver://{facets_secret['host']}:{facets_secret['port']};databaseName={_facetsdbName}"
+        fac_pcp_sp_db_url = "jdbc:sqlserver://" + _pcp_sp_db
+        fac_jdbc_options = {
+            "url": f"{fac_jdbc_url}",
+            "user": facets_secret['username'],
+            "password": facets_secret['password'],
+            "driver": "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+        }
+
+        query_submemkeys ="""
+         SELECT S.SBSB_ID,M.MEME_CK,S.SBSB_CK, S.GRGR_CK, G.GRGR_ID 
+          FROM CMC_SBSB_SUBSC S 
+          INNER JOIN CMC_GRGR_GROUP G ON G.GRGR_CK =S.GRGR_CK
+          INNER JOIN CMC_MEME_MEMBER M On S.SBSB_CK = M.SBSB_CK
+        """
+        df_facets_SubMemKeys = (
+            glueContext.spark_session.read.format("jdbc")
+                .option("url", fac_jdbc_url)
+                .option("user", facets_secret['username'])
+                .option("password", facets_secret['password'])
+                .option("query", query_submemkeys)
+                .load()
+        )
+        #df_facets_SubMemKeys.show()
+        show_dataframe_details(df_facets_SubMemKeys,"df_facets_SubMemKeys", displayCountFlag, 0, True)
+        df_facets_SubMemKeys.createOrReplaceTempView("facets_SubMem_dfTable")
+
+        # query_mcrp_rel = "Select MCRP_ID, MCRP_LAST_NAME, MCRP_FIRST_NAME, MCRP_MID_INIT from CMC_MCRP_RELAT_PER"
+        # df_facets_mcrp_rel = (
+        #     glueContext.spark_session.read.format("jdbc")
+        #         .option("url", fac_jdbc_url)
+        #         .option("user", facets_secret['username'])
+        #         .option("password", facets_secret['password'])
+        #         .option("query", query_mcrp_rel)
+        #         .load()
+        # )
+        # #df_facets_mcrp_rel.show()
+        # show_dataframe_details(df_facets_mcrp_rel,"df_facets_mcrp_rel", displayCountFlag, 0, True)
+        query_mepe ="""Select S.SBSB_ID,E.MEME_CK, CSPD_CAT,CSCS_ID, CSPI_ID,  MEPE_EFF_DT,MEPE_TERM_DT 
+        from CMC_MEPE_PRCS_ELIG E INNER JOIN CMC_MEME_MEMBER M 
+        ON M.MEME_CK =E.MEME_CK
+        INNER JOIN CMC_SBSB_SUBSC S 
+        ON S.SBSB_CK = M.SBSB_CK
+        WHERE CSPD_CAT ='M' AND  E.MEPE_ELIG_IND = 'Y' """
+
+        df_facets_mepe = (
+            glueContext.spark_session.read.format("jdbc")
+                .option("url", fac_jdbc_url)
+                .option("user", facets_secret['username'])
+                .option("password", facets_secret['password'])
+                .option("query", query_mepe)
+                .load()
+        )
+        #df_facets_mepe.show(10)
+        show_dataframe_details(df_facets_mepe,"df_facets_mepe", displayCountFlag, 10, True)
+        query_sbel ="""select S.SBSB_ID, E.SBEL_EFF_DT, E.CSPI_ID, E.SBEL_VOID_IND, E.SBEL_ELIG_TYPE
+        FROM CMC_SBEL_ELIG_ENT E 
+        INNER JOIN CMC_SBSB_SUBSC S 
+        ON S.SBSB_CK = E.SBSB_CK
+        WHERE E.SBEL_VOID_IND ='N'"""
+
+        df_facets_sbel = (
+            glueContext.spark_session.read.format("jdbc")
+                .option("url", fac_jdbc_url)
+                .option("user", facets_secret['username'])
+                .option("password", facets_secret['password'])
+                .option("query", query_sbel)
+                .load()
+        )
+        #df_facets_sbel.show(10)
+        show_dataframe_details(df_facets_sbel,"df_facets_sbel", displayCountFlag, 10, True)
+        query_prpr ="""SELECT   PRPR_ID  FROM  [CMC_PRPR_PROV] WHERE [PRPR_NPI] = '9999999999'"""
+        df_facets_prpr = (
+            glueContext.spark_session.read.format("jdbc")
+                .option("url", fac_jdbc_url)
+                .option("user", facets_secret['username'])
+                .option("password", facets_secret['password'])
+                .option("query", query_prpr)
+                .load()
+        )
+        #df_facets_prpr.show(20)
+        show_dataframe_details(df_facets_prpr,"df_facets_prpr", displayCountFlag, 20, True)
+        query_mctr ="""SELECT MCTR_VALUE, MCTR_DESC FROM CMC_MCTR_CD_TRANS WHERE MCTR_ENTITY ='MDAG'"""
+        df_facets_mctr = (
+            glueContext.spark_session.read.format("jdbc")
+                .option("url", fac_jdbc_url)
+                .option("user", facets_secret['username'])
+                .option("password", facets_secret['password'])
+                .option("query", query_mctr)
+                .load()
+        )
+        show_dataframe_details(df_facets_mctr,"df_facets_mctr", displayCountFlag, 20, True)
+
+        df_facets_sbel =df_facets_sbel.withColumn("f_SBEL_EFF_DT", to_date("SBEL_EFF_DT","MM/dd/yyyy"))
+        df_facets_mepe =df_facets_mepe.withColumn("f_MEPE_EFF_DT", to_date("MEPE_EFF_DT","MM/dd/yyyy")) \
+            .withColumn("f_MEPE_TERM_DT", to_date("MEPE_TERM_DT","MM/dd/yyyy"))
+        df_facets_sbel.createOrReplaceTempView("sbel_dfTable")
+        df_facets_mepe.createOrReplaceTempView("mepe_dfTable")
+
+        #df_facets_mepe.show()
+        show_dataframe_details(df_facets_mepe,"df_facets_mepe", displayCountFlag, 0, True)
+        #df_facets_sbel.show()
+        show_dataframe_details(df_facets_sbel,"df_facets_sbel", displayCountFlag, 0, True)
+
+        query_pbp ="""Select SBSB_ID as Subscriber_id,MEMD_HCFA_EFF_DT, MEMD_EVENT_EFF_DT 
+           FROM CMC_MEMD_MECR_DETL M INNER JOIN CMC_MEME_MEMBER MEME ON MEME.MEME_CK = M.MEME_CK 
+             INNER JOIN CMC_SBSB_SUBSC S ON S.SBSB_CK =MEME.SBSB_CK 
+            WHERE MEMD_EVENT_CD ='PBP' AND MEMD_HCFA_EFF_DT>=dateadd(year, -1, datename(year, getdate()) + '0101')"""
+        df_facets_pbp = (
+            glueContext.spark_session.read.format("jdbc")
+                .option("url", fac_jdbc_url)
+                .option("user", facets_secret['username'])
+                .option("password", facets_secret['password'])
+                .option("query", query_pbp)
+                .load()
+        )
+        show_dataframe_details(df_facets_pbp,"df_facets_pbp", displayCountFlag, 20, True)
+    except Exception as err:
+        #print(err)
+        logger.error(f'Unable to connect to facets database : {err}')
+        logger.info("FCT_EAMFCTMMS: ERROR: Unable to connect to facets database")
+    #dsdf= dfSql_sbwm.select("SBWM_ConcatResult")
+    #dsdf.write.text('s3://gbs-enrollment-dev-eamtomms/output/')
+
+else:
+    logger.info("No files to process")
+
+
+for file_key, _ in sorted_files:
+    logger.info(file_key)
+    file_path = f"s3://{_fct_eam_request_s3_bucket}/{file_key}"
+    logger.info(f"Input File: {file_path} {file_key}")
+    result = process_file(file_path, file_key)
+    logger.info(f"File Processed: {result}")
+
+job.commit()
