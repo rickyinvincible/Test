@@ -1,22 +1,53 @@
-Hello
+import io.cucumber.java.en.*;
+import org.openqa.selenium.*;
+import org.openqa.selenium.support.ui.*;
 
+import static org.junit.Assert.*;
 
-import boto3
+public class CustomReportsSteps {
+    WebDriver driver;
 
-def lambda_handler(event, context):
-    s3 = boto3.client('s3')
-    
-    bucket_name = 'your-s3-bucket-name'
-    object_key = 'your-object-key'
-    
-    response = s3.get_object(Bucket=bucket_name, Key=object_key)
-    
-    data = response['Body'].read()
-    
-    # Add your logic to process the data from the S3 object
-    
-    return {
-        'statusCode': 200,
-        'body': 'Data retrieved from S3 bucket: ' + data.decode('utf-8')
+    @Given("ExtProv user logs into the {string} Custom Reports site")
+    public void user_logs_into_custom_reports_site(String siteType) {
+        driver.get("https://yourwebsite.com/login"); // Replace with actual URL
+        driver.findElement(By.id("username")).sendKeys("yourUsername");
+        driver.findElement(By.id("password")).sendKeys("yourPassword");
+        driver.findElement(By.id("loginButton")).click();
     }
-.
+
+    @When("User clicks on ACA Reports Link")
+    public void user_clicks_on_ACA_reports_link() {
+        driver.findElement(By.id("acaReportsLink")).click(); // Replace with actual ID
+    }
+
+    @And("Click on dropdown and select {string}")
+    public void select_report_type(String reportType) {
+        WebElement dropdown = driver.findElement(By.id("reportDropdownId")); // Replace with actual ID
+        Select select = new Select(dropdown);
+        select.selectByVisibleText(reportType);
+    }
+
+    @And("If {string} exists, enter the value")
+    public void enter_program_code_if_exists(String programCode) {
+        try {
+            WebElement programCodeInput = driver.findElement(By.id("programCodeInputId")); // Replace with actual ID
+
+            if (programCodeInput.isDisplayed() && !programCode.isEmpty()) {
+                programCodeInput.sendKeys(programCode);
+            }
+        } catch (NoSuchElementException e) {
+            System.out.println("Program Code field not found, skipping...");
+        }
+    }
+
+    @And("Click on ViewReports")
+    public void click_on_view_reports() {
+        driver.findElement(By.id("viewReportsButtonId")).click(); // Replace with actual ID
+    }
+
+    @Then("Verify that report is generated")
+    public void verify_report_is_generated() {
+        WebElement confirmationMessage = driver.findElement(By.id("reportConfirmationId")); // Replace with actual ID
+        assertTrue("Report not generated!", confirmationMessage.isDisplayed());
+    }
+}
