@@ -51,3 +51,20 @@ public class CustomReportsSteps {
         assertTrue("Report not generated!", confirmationMessage.isDisplayed());
     }
 }
+
+
+WebElement clientNameElement = driver.findElement(By.xpath("//div[contains(@class,'row-label') and contains(.,'Client Name')]/following-sibling::div[@class='medium']"));
+
+        // Debugging: Check if element exists
+        if (clientNameElement.isDisplayed()) {
+            System.out.println("Element found: " + clientNameElement.getText());
+        }
+
+        // Extract text properly
+        String actualClientName = clientNameElement.getText().trim();
+
+        if (actualClientName.isEmpty()) {
+            actualClientName = clientNameElement.getAttribute("title"); // Try title if text is missing
+        }
+
+        //
