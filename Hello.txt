@@ -93,3 +93,9 @@ public void selectProviderType(WebDriver driver) {
 
     // Option 2: (alternate) select by value "A"
     // providerType.selectByValue("A");
+}
+
+
+
+WebElement nextBtn = driver.findElement(By.name("ctl0_MainBody_ctl0_ProviderSelect_ValidateTPIBtn"));
+((JavascriptExecutor) driver).executeScript("arguments[0].click();", nextBtn);
