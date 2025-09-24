@@ -99,3 +99,32 @@ public void selectProviderType(WebDriver driver) {
 
 WebElement nextBtn = driver.findElement(By.name("ctl0_MainBody_ctl0_ProviderSelect_ValidateTPIBtn"));
 ((JavascriptExecutor) driver).executeScript("arguments[0].click();", nextBtn);
+
+
+____________
+
+// --- Re-find the TPI radio after dropdown triggers the partial refresh ---
+WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(15));
+By tpiRadioBy = By.xpath("//*[contains(@name,'ctl0:MainBody:_ctl0:ProviderSelect:LookupType') and @value='TPI']");
+
+// Wait until it's clickable
+WebElement tpiRadio = wait.until(ExpectedConditions.elementToBeClickable(tpiRadioBy));
+
+// Scroll into view
+((JavascriptExecutor)driver).executeScript("arguments[0].scrollIntoView({block:'center'});", tpiRadio);
+
+// Try normal click
+try {
+    tpiRadio.click();
+} catch (Exception e) {
+    // Fallback: force selection + fire events so ASP.NET JS reacts
+    ((JavascriptExecutor)driver).executeScript(
+        "var r=arguments[0]; r.checked=true;"
+      + "['click','change','input'].forEach(function(evt){"
+      + " r.dispatchEvent(new Event(evt,{bubbles:true})); });",
+        tpiRadio
+    );
+}
+
+// Confirm it's selected
+wait.until(ExpectedConditions.elementSelectionStateToBe(tpiRadio, true));
