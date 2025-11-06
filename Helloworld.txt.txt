@@ -19,7 +19,39 @@ def make_api_call(username, password):
         'Authorization': f'Basic {encoded_credentials}',
         'Content-Type': 'application/x-www-form-urlencoded'
     }
+--========================
+using Microsoft.Extensions.Configuration;
 
+public static class CredentialsLoader
+{
+    // Returns (username, password)
+    public static (string user, string pwd) GetAckCredentials(IConfiguration config)
+    {
+        // Try JSON cipher first
+        var provider = config["Credentials:Provider"];
+        var cipherXml = config["Credentials:AppSettingsCipherXml"];
+        var cipherFile = config["Credentials:CipherFilePath"]; // optional
+
+        if (!string.IsNullOrWhiteSpace(provider) &&
+            (!string.IsNullOrWhiteSpace(cipherXml) || !string.IsNullOrWhiteSpace(cipherFile)))
+        {
+            var secrets = !string.IsNullOrWhiteSpace(cipherXml)
+                ? ProtectedAppSettingsReader.DecryptAppSettingsFromCipher(cipherXml!, provider!)
+                : ProtectedAppSettingsReader.DecryptFromFile(
+                      Path.Combine(AppContext.BaseDirectory, cipherFile!), provider!);
+
+            return (secrets["ACKUsername"], secrets["ACKPassword"]);
+        }
+
+        // Fallback: legacy app.config (only if you still ship it)
+        var cfg = ConfigurationManager.OpenExeConfiguration(ConfigurationUserLevel.None);
+        var section = cfg.GetSection("appSettings") as AppSettingsSection
+                      ?? throw new InvalidOperationException("appSettings not found.");
+        if (section.SectionInformation.IsProtected) section.SectionInformation.UnprotectSection();
+
+        return (section.Settings["ACKUsername"].Value, section.Settings["ACKPassword"].Value);
+    }
+}
     req = urllib.request.Request(url, data=data, headers=headers, method='POST')
 
     try:
