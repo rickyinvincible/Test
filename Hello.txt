@@ -128,3 +128,12 @@ try {
 
 // Confirm it's selected
 wait.until(ExpectedConditions.elementSelectionStateToBe(tpiRadio, true));
+--==========================================================
+
+while ($true) {
+    $wsh = New-Object -ComObject WScript.Shell
+    $wsh.SendKeys("{SCROLLLOCK}")
+    Start-Sleep -Milliseconds 200
+    $wsh.SendKeys("{SCROLLLOCK}")
+    Start-Sleep -Seconds 240
+}
