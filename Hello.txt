@@ -137,3 +137,5 @@ while ($true) {
     $wsh.SendKeys("{SCROLLLOCK}")
     Start-Sleep -Seconds 240
 }
+--===============
+Powershell -Executionpolicy Bypass -File filename.ps1
